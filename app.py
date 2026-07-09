@@ -53,6 +53,27 @@ ROLLUP_LABELS = {
 MONEY_FMT = "{:,.0f}"
 PCT_FMT = "{:+.2f}"
 
+# --- column-mapping config for uploaded files --------------------------------
+# Case-insensitive, whitespace-stripped aliases used to auto-guess which
+# uploaded column corresponds to each required schema field.
+COLUMN_GUESS = {
+    "item_name": ["item_name", "наименование", "товар", "название", "name", "item", "product", "позиция"],
+    "supplier": ["supplier", "поставщик", "vendor", "поставщики", "провайдер"],
+    "category": ["category", "категория", "тип", "type", "группа"],
+    "qty": ["qty", "quantity", "кол-во", "количество", "count", "объем", "объём"],
+    "unit_price": ["unit_price", "цена", "price", "цена за ед", "цена за единицу", "стоимость единицы", "unit cost"],
+    "subtotal": ["subtotal", "сумма", "итого", "total", "amount", "сумма итого", "стоимость"],
+}
+MAPPING_FIELD_LABELS = {
+    "item_name": "Наименование товара",
+    "supplier": "Поставщик",
+    "category": "Категория",
+    "qty": "Количество",
+    "unit_price": "Цена за единицу (₸)",
+    "subtotal": "Сумма (₸)",
+}
+NOT_SELECTED = "— не выбрано —"
+
 
 # --- rendering helpers (presentation only, no math) --------------------------
 def inject_css() -> None:
@@ -177,6 +198,44 @@ def render_rollup(rollup: pd.DataFrame, key_col: str, key_label: str) -> None:
     st.dataframe(styled, use_container_width=True)
 
 
+def map_columns(df: pd.DataFrame, file_label: str) -> pd.DataFrame:
+    """Map an uploaded file's columns onto the required schema fields.
+
+    Presentation-layer only: auto-guesses a mapping, lets the user confirm it via
+    selectboxes, then renames/subsets columns so the result can be handed to
+    core.schema.normalize(). No arithmetic here.
+    """
+    actual_cols = list(df.columns)
+    # normalized (lower, stripped) actual name -> real column name, for guessing
+    lookup = {str(c).strip().lower(): c for c in actual_cols}
+
+    with st.expander("Сопоставление колонок — " + file_label, expanded=True):
+        st.info(
+            "Укажите, какие колонки вашего файла соответствуют нужным полям. "
+            "Система попыталась определить их автоматически."
+        )
+        selection = {}
+        for field, aliases in COLUMN_GUESS.items():
+            guessed = next((lookup[a] for a in aliases if a in lookup), None)
+            options = [NOT_SELECTED] + actual_cols
+            default_index = options.index(guessed) if guessed in options else 0
+            selection[field] = st.selectbox(
+                MAPPING_FIELD_LABELS[field],
+                options,
+                index=default_index,
+                key=f"map_{file_label}_{field}",
+            )
+
+    if any(chosen == NOT_SELECTED for chosen in selection.values()):
+        st.error("Необходимо выбрать все обязательные колонки")
+        st.stop()
+
+    # rename chosen columns to schema fields, then drop everything else
+    rename_map = {chosen: field for field, chosen in selection.items()}
+    renamed = df.rename(columns=rename_map)
+    return renamed[list(COLUMN_GUESS)].copy()
+
+
 # --- page --------------------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Аудит закупок компании", page_icon=None)
 inject_css()
@@ -203,8 +262,8 @@ df_a = df_b = None
 using_demo = False
 try:
     if file_a is not None and file_b is not None:
-        df_a = normalize(pd.read_excel(file_a))
-        df_b = normalize(pd.read_excel(file_b))
+        df_a = normalize(map_columns(pd.read_excel(file_a), "Лист А"))
+        df_b = normalize(map_columns(pd.read_excel(file_b), "Лист Б"))
     elif st.session_state.get("use_demo", False):
         df_a, df_b, _ = generate(seed=42)
         using_demo = True
