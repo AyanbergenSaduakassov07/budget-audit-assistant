@@ -1,0 +1,280 @@
+"""Streamlit UI for the procurement comparison tool.
+
+This is the ONLY file allowed to import streamlit (SPEC.md architecture rule).
+It contains no arithmetic or comparison logic — every number shown here comes
+from core.compare / core.schema. app.py only reshapes, renames, formats, and
+renders what core returns.
+"""
+
+import pandas as pd
+import streamlit as st
+
+from core.synth import generate
+from core.schema import normalize
+from core.compare import compare
+
+# --- palette (SPEC design system) -------------------------------------------
+NAVY = "#1F3A5F"
+BG = "#F6F4EF"
+ANOMALY = "#FFCDD2"
+ONLY_A = "#FFF3C4"
+ONLY_B = "#FFE0B2"
+POSITIVE = "#C8E6C9"
+NEGATIVE = "#FFCDD2"
+
+# --- Russian display labels --------------------------------------------------
+SHEET_LABELS = {
+    "item_name": "Наименование",
+    "supplier": "Поставщик",
+    "category": "Категория",
+    "qty": "Кол-во",
+    "unit_price": "Цена за ед., ₸",
+    "subtotal": "Сумма, ₸",
+}
+DELTA_LABELS = {
+    "item_name": "Наименование",
+    "supplier": "Поставщик",
+    "unit_price_a": "Цена А, ₸",
+    "unit_price_b": "Цена Б, ₸",
+    "pct_delta_price": "Δ цены, %",
+    "delta_subtotal": "Δ сумма, ₸",
+    "contribution_pct": "Вклад, %",
+    "cumulative_pct": "Накопл., %",
+    "severity_score": "Северити",
+    "is_price_anomaly": "Аномалия",
+}
+ROLLUP_LABELS = {
+    "subtotal_a": "Сумма А, ₸",
+    "subtotal_b": "Сумма Б, ₸",
+    "delta_subtotal": "Δ, ₸",
+    "pct_delta": "Δ, %",
+}
+
+MONEY_FMT = "{:,.0f}"
+PCT_FMT = "{:+.2f}"
+
+
+# --- rendering helpers (presentation only, no math) --------------------------
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        .stApp { background-color: #F6F4EF; }
+        h1, h2, h3, h4, h5, h6 { color: #1F3A5F !important; }
+        p, label, span, div { color: #2C2C2A; }
+        .stMetric label { color: #5F5E5A !important; font-size: 13px; }
+        .stMetric [data-testid="stMetricValue"] { color: #1F3A5F !important; font-size: 22px; font-weight: 700; }
+        .stCaption { color: #5F5E5A !important; }
+        .stInfo { background-color: #E8F4FD !important; color: #1F3A5F !important; }
+        section[data-testid="stSidebar"] { background-color: #FFFFFF; }
+        [data-testid="stDataFrame"] { background-color: #FFFFFF; border-radius: 6px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _build_sheet(matched: pd.DataFrame, only_in: pd.DataFrame, side: str) -> pd.DataFrame:
+    """Reassemble one full normalized sheet from core's compare() output.
+
+    Values (including arithmetic_error) come straight from core — this only
+    selects, renames, and concatenates for display.
+    """
+    m = matched[
+        ["item_name", "supplier", "category",
+         f"qty_{side}", f"unit_price_{side}", f"subtotal_{side}", f"arithmetic_error_{side}"]
+    ].copy()
+    m.columns = ["item_name", "supplier", "category", "qty", "unit_price", "subtotal", "arithmetic_error"]
+    o = only_in[
+        ["item_name", "supplier", "category", "qty", "unit_price", "subtotal", "arithmetic_error"]
+    ].copy()
+    return pd.concat([m, o], ignore_index=True)
+
+
+def render_sheet(df: pd.DataFrame) -> None:
+    """Split-screen sheet: 6 Russian columns, arithmetic-error rows in red."""
+    mask = df["arithmetic_error"].reset_index(drop=True)
+    disp = df[list(SHEET_LABELS)].rename(columns=SHEET_LABELS).reset_index(drop=True)
+
+    def highlight(row):
+        bg = ANOMALY if bool(mask.iloc[row.name]) else ""
+        return [f"background-color: {bg}"] * len(row)
+
+    styled = disp.style.apply(highlight, axis=1).format(
+        {SHEET_LABELS["unit_price"]: MONEY_FMT,
+         SHEET_LABELS["subtotal"]: MONEY_FMT,
+         SHEET_LABELS["qty"]: MONEY_FMT}
+    )
+    st.dataframe(styled, use_container_width=True)
+
+
+def render_delta_table(matched: pd.DataFrame) -> None:
+    disp = matched[list(DELTA_LABELS)].rename(columns=DELTA_LABELS).reset_index(drop=True)
+    disp[DELTA_LABELS["is_price_anomaly"]] = disp[DELTA_LABELS["is_price_anomaly"]].map(
+        {True: "Да", False: "Нет"}
+    )
+
+    def highlight(row):
+        i = row.name
+        anomaly = bool(matched["is_price_anomaly"].iloc[i])
+        pct = matched["pct_delta_price"].iloc[i]
+        if anomaly:
+            bg = ANOMALY
+        elif pct > 0:
+            bg = POSITIVE
+        else:
+            bg = ""  # negative and non-anomaly: no highlight
+        return [f"background-color: {bg}"] * len(row)
+
+    styled = disp.style.apply(highlight, axis=1).format(
+        {
+            DELTA_LABELS["unit_price_a"]: MONEY_FMT,
+            DELTA_LABELS["unit_price_b"]: MONEY_FMT,
+            DELTA_LABELS["delta_subtotal"]: MONEY_FMT,
+            DELTA_LABELS["pct_delta_price"]: PCT_FMT,
+            DELTA_LABELS["contribution_pct"]: PCT_FMT,
+            DELTA_LABELS["cumulative_pct"]: PCT_FMT,
+            DELTA_LABELS["severity_score"]: "{:.2f}",
+        }
+    )
+    st.dataframe(styled, use_container_width=True)
+
+
+def render_only_in(df: pd.DataFrame, bg_color: str) -> None:
+    disp = df[list(SHEET_LABELS)].rename(columns=SHEET_LABELS).reset_index(drop=True)
+    styled = disp.style.apply(
+        lambda row: [f"background-color: {bg_color}"] * len(row), axis=1
+    ).format(
+        {SHEET_LABELS["unit_price"]: MONEY_FMT,
+         SHEET_LABELS["subtotal"]: MONEY_FMT,
+         SHEET_LABELS["qty"]: MONEY_FMT}
+    )
+    st.dataframe(styled, use_container_width=True)
+
+
+def render_rollup(rollup: pd.DataFrame, key_col: str, key_label: str) -> None:
+    ordered = rollup.sort_values(
+        "delta_subtotal", key=lambda s: s.abs(), ascending=False
+    ).reset_index(drop=True)
+    labels = {key_col: key_label, **ROLLUP_LABELS}
+    disp = ordered[list(labels)].rename(columns=labels)
+
+    def color_pct(val):
+        if val > 0:
+            return f"background-color: {NEGATIVE}"  # spend up = red
+        if val < 0:
+            return f"background-color: {POSITIVE}"  # spend down = green
+        return ""
+
+    styled = disp.style.map(color_pct, subset=[ROLLUP_LABELS["pct_delta"]]).format(
+        {
+            ROLLUP_LABELS["subtotal_a"]: MONEY_FMT,
+            ROLLUP_LABELS["subtotal_b"]: MONEY_FMT,
+            ROLLUP_LABELS["delta_subtotal"]: MONEY_FMT,
+            ROLLUP_LABELS["pct_delta"]: PCT_FMT,
+        }
+    )
+    st.dataframe(styled, use_container_width=True)
+
+
+# --- page --------------------------------------------------------------------
+st.set_page_config(layout="wide", page_title="Аудит закупок компании", page_icon=None)
+inject_css()
+
+# 1. HEADER
+st.title("Инструмент сравнения IT-закупок")
+st.caption("Аудит IT-бюджетов")
+st.divider()
+
+# 2. CONTROLS
+col_a, col_b, col_t = st.columns([2, 2, 1])
+with col_a:
+    file_a = st.file_uploader("Загрузить лист А (xlsx)", type=["xlsx"], key="file_a")
+with col_b:
+    file_b = st.file_uploader("Загрузить лист Б (xlsx)", type=["xlsx"], key="file_b")
+with col_t:
+    threshold = st.slider("Порог аномалии (%)", min_value=1, max_value=50, value=15, step=1)
+
+if st.button("Использовать синтетические данные для демо"):
+    st.session_state["use_demo"] = True
+
+# Decide the data source, run the comparison. All math happens inside compare().
+df_a = df_b = None
+using_demo = False
+try:
+    if file_a is not None and file_b is not None:
+        df_a = normalize(pd.read_excel(file_a))
+        df_b = normalize(pd.read_excel(file_b))
+    elif st.session_state.get("use_demo", False):
+        df_a, df_b, _ = generate(seed=42)
+        using_demo = True
+    else:
+        st.info("Загрузите два файла или запустите демо")
+        st.stop()
+
+    if using_demo:
+        st.info("Используются синтетические тестовые данные (seed=42)")
+
+    result = compare(df_a, df_b, threshold_pct=float(threshold))
+except ValueError as e:
+    st.error("Ошибка формата файла: " + str(e))
+    st.stop()
+
+summary = result["summary"]
+matched = result["matched"]
+
+# 3. SUMMARY METRICS
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Общее отклонение", f"{summary['total_pct_delta']:+.1f}%")
+m2.metric("Взвешенное Δ цены", f"{summary['weighted_avg_pct_delta_price']:+.1f}%")
+m3.metric("Доля аномалий", f"{summary['anomaly_rate']:.1f}%")
+with m4:
+    sub_matched, sub_only = st.columns(2)
+    sub_matched.metric("Совпало", summary["n_matched"])
+    sub_only.metric("Только А / Б", f"{summary['n_only_in_a']} / {summary['n_only_in_b']}")
+st.divider()
+
+# 4. SPLIT-SCREEN
+left, right = st.columns(2)
+with left:
+    st.subheader("Лист А — Дочерняя компания А")
+    render_sheet(_build_sheet(matched, result["only_in_a"], "a"))
+with right:
+    st.subheader("Лист Б — Дочерняя компания Б")
+    render_sheet(_build_sheet(matched, result["only_in_b"], "b"))
+st.divider()
+
+# 5. DELTA TABLE + Pareto
+st.subheader("Таблица расхождений (совпавшие позиции)")
+render_delta_table(matched)
+if len(matched) >= 2:
+    st.caption(
+        f"Топ-2 позиции объясняют {matched['cumulative_pct'].iloc[1]:.1f}% суммарного отклонения"
+    )
+st.divider()
+
+# 6. MISSING / NEW ROWS
+only_left, only_right = st.columns(2)
+with only_left:
+    st.subheader("Только в листе А (отсутствуют в Б)")
+    if len(result["only_in_a"]) == 0:
+        st.success("Все позиции листа А присутствуют в листе Б")
+    else:
+        render_only_in(result["only_in_a"], ONLY_A)
+with only_right:
+    st.subheader("Только в листе Б (новые позиции)")
+    if len(result["only_in_b"]) == 0:
+        st.success("Все позиции листа Б присутствуют в листе А")
+    else:
+        render_only_in(result["only_in_b"], ONLY_B)
+st.divider()
+
+# 7. ROLLUPS
+with st.expander("Разбивка по поставщикам", expanded=False):
+    render_rollup(result["supplier_rollup"], "supplier", "Поставщик")
+with st.expander("Разбивка по категориям", expanded=False):
+    render_rollup(result["category_rollup"], "category", "Категория")
+
+# 8. FOOTER
+st.divider()
+st.caption("Аудит IT-бюджетов · MVP v1.0")
