@@ -5,8 +5,7 @@ schema description) -> SQL runs against the warehouse -> LLM phrases the answer
 in Russian using ONLY the numbers returned by the database. The model never
 invents figures; every number in the answer comes from the query result.
 
-Uses Google Gemini through its OpenAI-compatible endpoint (the `openai` client
-pointed at generativelanguage.googleapis.com), not a vendor-specific SDK.
+Uses Google Gemini through its native SDK (`google-genai`), not a vendor-specific SDK.
 
 Per SPEC.md architecture rule: this module is pure — no streamlit imports.
 """
@@ -14,13 +13,36 @@ Per SPEC.md architecture rule: this module is pure — no streamlit imports.
 from __future__ import annotations
 
 import os
+import time
 
-from openai import OpenAI
+from google import genai
+from google.genai import errors as genai_errors
 
 from core import warehouse
 
-_MODEL = "gemini-2.5-flash"
-_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+_MODEL = "gemini-flash-latest"
+
+# Retry transient server-side failures (e.g. 503 "high demand", 429 rate limit)
+# with exponential backoff. These are load spikes on Google's side, not bugs in
+# the request, so a short wait and retry usually clears them.
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+_MAX_ATTEMPTS = 5
+_BASE_DELAY_S = 2.0
+
+
+def _generate_content(client: genai.Client, prompt: str) -> str:
+    """Call Gemini with retry + exponential backoff on transient server errors."""
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            response = client.models.generate_content(model=_MODEL, contents=prompt)
+            return response.text or ""
+        except genai_errors.APIError as exc:
+            transient = exc.code in _RETRY_STATUS
+            if not transient or attempt == _MAX_ATTEMPTS - 1:
+                raise
+            time.sleep(_BASE_DELAY_S * (2**attempt))
+    # Unreachable: the loop either returns or raises on the final attempt.
+    raise RuntimeError("retry loop exited without a result")
 
 # Few-shot examples pairing Russian questions with the SQL they should produce.
 # They deliberately exercise the Russian category values so the model learns to
@@ -49,8 +71,8 @@ _SQL_EXAMPLES = [
 ]
 
 
-def _get_client() -> OpenAI:
-    """Build the OpenAI client pointed at Gemini, or fail with a clear message."""
+def _get_client() -> genai.Client:
+    """Build the Gemini client, or fail with a clear message."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError(
@@ -58,7 +80,7 @@ def _get_client() -> OpenAI:
             "Set it to your Google Gemini API key, e.g.:\n"
             "    export GEMINI_API_KEY=your_key_here"
         )
-    return OpenAI(api_key=api_key, base_url=_BASE_URL)
+    return genai.Client(api_key=api_key)
 
 
 def _strip_sql_fences(text: str) -> str:
@@ -75,13 +97,13 @@ def _strip_sql_fences(text: str) -> str:
     return cleaned.strip()
 
 
-def _generate_sql(client: OpenAI, question: str, schema_description: str) -> str:
+def _generate_sql(client: genai.Client, question: str, schema_description: str) -> str:
     """Ask the model to turn a Russian question into a single SQLite SELECT."""
     example_block = "\n\n".join(
         f"Вопрос: {q}\nSQL: {sql}" for q, sql in _SQL_EXAMPLES
     )
 
-    system_prompt = (
+    prompt = (
         "You are a SQL generator for a procurement database (SQLite). "
         "Given a question in Russian, return exactly ONE valid SQLite SELECT "
         "query that answers it. Rules:\n"
@@ -93,21 +115,14 @@ def _generate_sql(client: OpenAI, question: str, schema_description: str) -> str
         "- Monetary totals use SUM(subtotal).\n\n"
         f"{schema_description}\n"
         "Examples:\n"
-        f"{example_block}"
+        f"{example_block}\n\n"
+        f"Вопрос: {question}\nSQL:"
     )
 
-    response = client.chat.completions.create(
-        model=_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Вопрос: {question}\nSQL:"},
-        ],
-        temperature=0,
-    )
-    return _strip_sql_fences(response.choices[0].message.content or "")
+    return _strip_sql_fences(_generate_content(client, prompt))
 
 
-def _phrase_answer(client: OpenAI, question: str, sql: str, result_text: str, empty: bool) -> str:
+def _phrase_answer(client: genai.Client, question: str, sql: str, result_text: str, empty: bool) -> str:
     """Ask the model to phrase the DB result as a concise Russian answer."""
     if empty:
         data_instruction = (
@@ -121,26 +136,16 @@ def _phrase_answer(client: OpenAI, question: str, sql: str, result_text: str, em
             "не выдумывай. Суммы в тенге (KZT)."
         )
 
-    system_prompt = (
+    prompt = (
         "Ты аналитик по закупкам компании. Отвечай на русском языке, кратко и по делу. "
-        "Все числа бери строго из результата SQL-запроса, ничего не придумывай."
-    )
-    user_prompt = (
+        "Все числа бери строго из результата SQL-запроса, ничего не придумывай.\n\n"
         f"Вопрос пользователя: {question}\n\n"
         f"Выполненный SQL:\n{sql}\n\n"
         f"Результат запроса:\n{result_text}\n\n"
         f"{data_instruction}"
     )
 
-    response = client.chat.completions.create(
-        model=_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-    )
-    return (response.choices[0].message.content or "").strip()
+    return _generate_content(client, prompt).strip()
 
 
 def answer(question: str, db_path: str = "procurement.db") -> dict:
