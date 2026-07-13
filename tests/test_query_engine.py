@@ -1,0 +1,87 @@
+"""Tests for the Russian query engine and the warehouse layer beneath it.
+
+The query engine calls the live Gemini API (paid / daily-quota limited), so the
+two tests that hit it are marked `@pytest.mark.api` and can be deselected with
+`-m "not api"`. The warehouse-only test runs for free and needs no marker.
+"""
+
+import pytest
+
+from core.synth import generate_group
+from core.warehouse import build_warehouse, run_sql
+from core.query_engine import answer
+
+
+def test_warehouse_totals_match_dataframe():
+    """The SQL warehouse must return the same per-subsidiary totals as pandas.
+
+    Validates the warehouse layer (schema + run_sql) with no API cost: build the
+    warehouse from the synthetic group, then check that a GROUP BY SUM in SQL
+    matches a groupby().sum() computed directly on the source DataFrame.
+    """
+    df, _ = generate_group()
+    build_warehouse(df)
+
+    expected = df.groupby("subsidiary")["subtotal"].sum()
+
+    result = run_sql(
+        "SELECT subsidiary, SUM(subtotal) as total FROM procurements "
+        "GROUP BY subsidiary"
+    )
+    actual = result.set_index("subsidiary")["total"]
+
+    # Every subsidiary present in the DataFrame must appear in the SQL result.
+    assert set(actual.index) == set(expected.index)
+    for subsidiary, expected_total in expected.items():
+        assert actual[subsidiary] == pytest.approx(expected_total, abs=0.01)
+
+
+@pytest.mark.api
+def test_engine_returns_correct_total():
+    """answer() must surface the true total as an actual value in the data.
+
+    We check the returned DataFrame (result["data"]), not the natural-language
+    text, so the assertion is about the number the SQL actually computed rather
+    than how the model chose to phrase it.
+    """
+    df, _ = generate_group()
+    build_warehouse(df)
+
+    mask = (df["subsidiary"] == "Subsidiary A") & (df["year"] == 2024)
+    true_total = round(df.loc[mask, "subtotal"].sum())
+
+    result = answer("Сколько всего потратил Subsidiary A в 2024 году?")
+
+    data = result["data"]
+    assert data is not None and not data.empty
+
+    values = data.select_dtypes(include="number").to_numpy().ravel()
+    assert any(round(v) == true_total for v in values), (
+        f"expected {true_total} in returned data values {list(values)}"
+    )
+
+
+@pytest.mark.api
+def test_engine_handles_unknown_gracefully():
+    """A query about a nonexistent subsidiary must not crash or invent a number.
+
+    Acceptable outcomes: an error is set, the returned data is None/empty, or the
+    data holds no real number (a SUM over zero matching rows comes back as a
+    single NULL/NaN row — no figure was fabricated). What is NOT acceptable is a
+    concrete number for a company that does not exist in the warehouse.
+    """
+    df, _ = generate_group()
+    build_warehouse(df)
+
+    result = answer("Сколько потратила компания НесуществующаяКорпорация?")
+
+    data = result["data"]
+    if result["error"] is not None or data is None or data.empty:
+        return
+
+    # Non-empty result is only acceptable if it contains no actual numeric value
+    # (i.e. every numeric cell is NULL/NaN — nothing was invented).
+    numeric = data.select_dtypes(include="number")
+    assert numeric.empty or numeric.isna().all().all(), (
+        f"engine returned a concrete number for an unknown subsidiary: {data!r}"
+    )

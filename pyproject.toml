@@ -21,3 +21,4 @@ dev = [
 # Flat layout: make the project root importable so tests can use absolute
 # imports (from core.synth import generate) without an editable install.
 pythonpath = ["."]
+markers = ["api: tests that call the live Gemini API (costs quota, run selectively)"]

@@ -20,23 +20,46 @@ from google.genai import errors as genai_errors
 
 from core import warehouse
 
-_MODEL = "gemini-flash-latest"
+_MODEL = "gemini-flash-lite-latest"
 
-# Retry transient server-side failures (e.g. 503 "high demand", 429 rate limit)
-# with exponential backoff. These are load spikes on Google's side, not bugs in
-# the request, so a short wait and retry usually clears them.
+# Retry transient server-side failures (e.g. 503 "high demand", 429 per-minute
+# rate limit) with exponential backoff. These are load spikes on Google's side,
+# not bugs in the request, so a short wait and retry usually clears them.
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _MAX_ATTEMPTS = 5
 _BASE_DELAY_S = 2.0
 
+# Markers in a 429 error message that identify daily (per-day) quota exhaustion
+# rather than a transient per-minute rate limit. A daily limit will not clear on
+# a short backoff, so retrying is pointless — we surface it immediately instead.
+_DAILY_QUOTA_MARKERS = ("PerDay", "per_day", "RPD")
+
+
+class DailyQuotaExhausted(Exception):
+    """Raised when the free-tier daily API quota is exhausted (not retryable)."""
+
+
+def _is_daily_quota_error(exc: genai_errors.APIError) -> bool:
+    """True if a 429 is a per-day quota exhaustion (vs. a per-minute rate limit)."""
+    if exc.code != 429:
+        return False
+    message = str(exc)
+    return any(marker in message for marker in _DAILY_QUOTA_MARKERS)
+
 
 def _generate_content(client: genai.Client, prompt: str) -> str:
-    """Call Gemini with retry + exponential backoff on transient server errors."""
+    """Call Gemini with retry + exponential backoff on transient server errors.
+
+    A 429 caused by daily quota exhaustion is not transient — it raises
+    DailyQuotaExhausted immediately so the caller can surface a clear message.
+    """
     for attempt in range(_MAX_ATTEMPTS):
         try:
             response = client.models.generate_content(model=_MODEL, contents=prompt)
             return response.text or ""
         except genai_errors.APIError as exc:
+            if _is_daily_quota_error(exc):
+                raise DailyQuotaExhausted(str(exc)) from exc
             transient = exc.code in _RETRY_STATUS
             if not transient or attempt == _MAX_ATTEMPTS - 1:
                 raise
@@ -164,25 +187,31 @@ def answer(question: str, db_path: str = "procurement.db") -> dict:
     client = _get_client()
     schema_description = warehouse.get_schema_description(db_path)
 
-    # Step 1 — generate SQL.
-    sql = _generate_sql(client, question, schema_description)
-    result["sql"] = sql
-
-    # Step 2 — execute (never crash on a bad query).
     try:
-        df = warehouse.run_sql(sql, db_path)
-    except Exception as exc:  # SQL/DB errors surfaced, not raised
-        message = f"Не удалось выполнить запрос к данным: {exc}"
+        # Step 1 — generate SQL.
+        sql = _generate_sql(client, question, schema_description)
+        result["sql"] = sql
+
+        # Step 2 — execute (never crash on a bad query).
+        try:
+            df = warehouse.run_sql(sql, db_path)
+        except Exception as exc:  # SQL/DB errors surfaced, not raised
+            message = f"Не удалось выполнить запрос к данным: {exc}"
+            result["error"] = message
+            result["answer"] = message
+            return result
+
+        result["data"] = df
+
+        # Step 3 — phrase the answer in Russian from the actual result.
+        result_text = df.to_string(index=False) if not df.empty else "(пустой результат)"
+        result["answer"] = _phrase_answer(client, question, sql, result_text, empty=df.empty)
+        return result
+    except DailyQuotaExhausted:
+        message = "Дневной лимит бесплатного API исчерпан. Попробуйте позже."
         result["error"] = message
         result["answer"] = message
         return result
-
-    result["data"] = df
-
-    # Step 3 — phrase the answer in Russian from the actual result.
-    result_text = df.to_string(index=False) if not df.empty else "(пустой результат)"
-    result["answer"] = _phrase_answer(client, question, sql, result_text, empty=df.empty)
-    return result
 
 
 if __name__ == "__main__":
