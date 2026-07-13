@@ -9,9 +9,20 @@ renders what core returns.
 import pandas as pd
 import streamlit as st
 
-from core.synth import generate
+from core.synth import generate, generate_group
 from core.schema import normalize
 from core.compare import compare
+from core.warehouse import (
+    build_warehouse,
+    get_group_summary,
+    get_yearly_totals,
+    get_subsidiary_totals_for_year,
+    get_subsidiary_totals,
+)
+from core.query_engine import answer
+
+# Most recent year covered by the synthetic group data (see synth._GROUP_YEARS).
+LATEST_YEAR = 2026
 
 # --- palette (SPEC design system) -------------------------------------------
 NAVY = "#1F3A5F"
@@ -236,104 +247,237 @@ def map_columns(df: pd.DataFrame, file_label: str) -> pd.DataFrame:
     return renamed[list(COLUMN_GUESS)].copy()
 
 
+# --- chat tab (group-level data) --------------------------------------------
+@st.cache_resource
+def init_group_warehouse() -> str:
+    """Generate the synthetic group and build its warehouse exactly once.
+
+    Cached across reruns so the SQLite warehouse is built a single time per
+    session rather than on every Streamlit rerun. Returns the db path.
+    """
+    df, _ = generate_group()
+    return build_warehouse(df)
+
+
+def render_chat_tab() -> None:
+    """Chat UI over the group warehouse. No math/SQL here — only answer() calls."""
+    db_path = init_group_warehouse()
+
+    st.subheader("Чат с данными группы")
+    st.caption("Задайте вопрос на русском по закупкам всех дочерних компаний")
+
+    if "chat_history" not in st.session_state:
+        st.session_state["chat_history"] = []
+
+    if st.button("Очистить чат"):
+        st.session_state["chat_history"] = []
+        st.rerun()
+
+    # Render history top to bottom.
+    for entry in st.session_state["chat_history"]:
+        with st.chat_message("user"):
+            st.write(entry["question"])
+        with st.chat_message("assistant"):
+            if entry.get("error"):
+                st.error(entry["error"])
+            else:
+                st.write(entry["answer"])
+        with st.expander("Запрос к базе"):
+            if entry.get("sql"):
+                st.code(entry["sql"], language="sql")
+            if entry.get("data") is not None:
+                st.dataframe(entry["data"], use_container_width=True)
+
+    question = st.chat_input("Спросите про закупки группы…")
+    if question:
+        res = answer(question, db_path)
+        st.session_state["chat_history"].append(
+            {
+                "question": res["question"],
+                "answer": res["answer"],
+                "sql": res["sql"],
+                "data": res["data"],
+                "error": res["error"],
+            }
+        )
+        st.rerun()
+
+
+def render_analytics_tab() -> None:
+    """Group-wide analytics dashboard. All aggregation lives in core.warehouse."""
+    db_path = init_group_warehouse()
+
+    st.subheader("Аналитика по группе")
+    st.caption("Сводные показатели закупок по всем дочерним компаниям")
+
+    # 1. Headline metric cards.
+    summary = get_group_summary(db_path)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Общие расходы группы, ₸", MONEY_FMT.format(summary["total_spend"]))
+    c2.metric("Дочерних компаний", summary["n_subsidiaries"])
+    c3.metric("Лет в данных", summary["n_years"])
+    st.divider()
+
+    # 2. Spend per subsidiary, latest year, descending.
+    st.subheader(f"Расходы по дочерним компаниям — {LATEST_YEAR}")
+    latest = get_subsidiary_totals_for_year(LATEST_YEAR, db_path)
+    st.bar_chart(latest, x="subsidiary", y="total_spend")
+
+    # 3. Group spend trend across all years.
+    st.subheader("Динамика общих расходов группы по годам")
+    yearly = get_yearly_totals(db_path)
+    st.line_chart(yearly, x="year", y="total_spend")
+
+    # 4. Ranked subsidiary totals table.
+    st.subheader("Рейтинг дочерних компаний по расходам (все годы)")
+    totals = get_subsidiary_totals(db_path).rename(
+        columns={"rank": "Ранг", "subsidiary": "Дочерняя компания", "total_spend": "Сумма, ₸"}
+    )
+    st.dataframe(
+        totals.style.format({"Сумма, ₸": MONEY_FMT}),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def render_comparison_tab() -> None:
+    """The existing single-sheet comparison workflow, unchanged."""
+    # 1. HEADER
+    st.title("Инструмент сравнения IT-закупок")
+    st.caption("Аудит IT-бюджетов")
+    st.divider()
+
+    # 2. CONTROLS
+    col_a, col_b, col_t = st.columns([2, 2, 1])
+    with col_a:
+        file_a = st.file_uploader("Загрузить лист А (xlsx)", type=["xlsx"], key="file_a")
+    with col_b:
+        file_b = st.file_uploader("Загрузить лист Б (xlsx)", type=["xlsx"], key="file_b")
+    with col_t:
+        threshold = st.slider("Порог аномалии (%)", min_value=1, max_value=50, value=15, step=1)
+
+    if st.button("Использовать синтетические данные для демо"):
+        st.session_state["use_demo"] = True
+
+    # Decide the data source, run the comparison. All math happens inside compare().
+    df_a = df_b = None
+    using_demo = False
+    try:
+        if file_a is not None and file_b is not None:
+            df_a = normalize(map_columns(pd.read_excel(file_a), "Лист А"))
+            df_b = normalize(map_columns(pd.read_excel(file_b), "Лист Б"))
+        elif st.session_state.get("use_demo", False):
+            df_a, df_b, _ = generate(seed=42)
+            using_demo = True
+        else:
+            st.info("Загрузите два файла или запустите демо")
+            st.stop()
+
+        if using_demo:
+            st.info("Используются синтетические тестовые данные (seed=42)")
+
+        result = compare(df_a, df_b, threshold_pct=float(threshold))
+    except ValueError as e:
+        st.error("Ошибка формата файла: " + str(e))
+        st.stop()
+
+    summary = result["summary"]
+    matched = result["matched"]
+
+    # 3. SUMMARY METRICS
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Общее отклонение", f"{summary['total_pct_delta']:+.1f}%")
+    m2.metric("Взвешенное Δ цены", f"{summary['weighted_avg_pct_delta_price']:+.1f}%")
+    m3.metric("Доля аномалий", f"{summary['anomaly_rate']:.1f}%")
+    with m4:
+        sub_matched, sub_only = st.columns(2)
+        sub_matched.metric("Совпало", summary["n_matched"])
+        sub_only.metric("Только А / Б", f"{summary['n_only_in_a']} / {summary['n_only_in_b']}")
+    st.divider()
+
+    # 4. SPLIT-SCREEN
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Лист А — Дочерняя компания А")
+        render_sheet(_build_sheet(matched, result["only_in_a"], "a"))
+    with right:
+        st.subheader("Лист Б — Дочерняя компания Б")
+        render_sheet(_build_sheet(matched, result["only_in_b"], "b"))
+    st.divider()
+
+    # 5. DELTA TABLE + Pareto
+    st.subheader("Таблица расхождений (совпавшие позиции)")
+    render_delta_table(matched)
+    if len(matched) >= 2:
+        st.caption(
+            f"Топ-2 позиции объясняют {matched['cumulative_pct'].iloc[1]:.1f}% суммарного отклонения"
+        )
+    st.divider()
+
+    # 6. MISSING / NEW ROWS
+    only_left, only_right = st.columns(2)
+    with only_left:
+        st.subheader("Только в листе А (отсутствуют в Б)")
+        if len(result["only_in_a"]) == 0:
+            st.success("Все позиции листа А присутствуют в листе Б")
+        else:
+            render_only_in(result["only_in_a"], ONLY_A)
+    with only_right:
+        st.subheader("Только в листе Б (новые позиции)")
+        if len(result["only_in_b"]) == 0:
+            st.success("Все позиции листа Б присутствуют в листе А")
+        else:
+            render_only_in(result["only_in_b"], ONLY_B)
+    st.divider()
+
+    # 7. ROLLUPS
+    with st.expander("Разбивка по поставщикам", expanded=False):
+        render_rollup(result["supplier_rollup"], "supplier", "Поставщик")
+    with st.expander("Разбивка по категориям", expanded=False):
+        render_rollup(result["category_rollup"], "category", "Категория")
+
+    # 8. FOOTER
+    st.divider()
+    st.caption("Аудит IT-бюджетов · MVP v1.0")
+
+
 # --- page --------------------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Аудит закупок компании", page_icon=None)
 inject_css()
 
-# 1. HEADER
-st.title("Инструмент сравнения IT-закупок")
-st.caption("Аудит IT-бюджетов")
-st.divider()
+# Global header shown above the tabs, so someone opening the app cold understands
+# the layout before clicking anything.
+st.title("Аудит закупок компании")
+st.caption(
+    "**Сравнение листов** — сопоставление двух Excel-файлов закупок с поиском "
+    "аномалий цен.  ·  **Чат с данными** — вопросы по закупкам всей группы на "
+    "русском языке.  ·  **Аналитика по группе** — сводные графики и рейтинг "
+    "дочерних компаний."
+)
 
-# 2. CONTROLS
-col_a, col_b, col_t = st.columns([2, 2, 1])
-with col_a:
-    file_a = st.file_uploader("Загрузить лист А (xlsx)", type=["xlsx"], key="file_a")
-with col_b:
-    file_b = st.file_uploader("Загрузить лист Б (xlsx)", type=["xlsx"], key="file_b")
-with col_t:
-    threshold = st.slider("Порог аномалии (%)", min_value=1, max_value=50, value=15, step=1)
-
-if st.button("Использовать синтетические данные для демо"):
-    st.session_state["use_demo"] = True
-
-# Decide the data source, run the comparison. All math happens inside compare().
-df_a = df_b = None
-using_demo = False
-try:
-    if file_a is not None and file_b is not None:
-        df_a = normalize(map_columns(pd.read_excel(file_a), "Лист А"))
-        df_b = normalize(map_columns(pd.read_excel(file_b), "Лист Б"))
-    elif st.session_state.get("use_demo", False):
-        df_a, df_b, _ = generate(seed=42)
-        using_demo = True
-    else:
-        st.info("Загрузите два файла или запустите демо")
-        st.stop()
-
-    if using_demo:
-        st.info("Используются синтетические тестовые данные (seed=42)")
-
-    result = compare(df_a, df_b, threshold_pct=float(threshold))
-except ValueError as e:
-    st.error("Ошибка формата файла: " + str(e))
-    st.stop()
-
-summary = result["summary"]
-matched = result["matched"]
-
-# 3. SUMMARY METRICS
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Общее отклонение", f"{summary['total_pct_delta']:+.1f}%")
-m2.metric("Взвешенное Δ цены", f"{summary['weighted_avg_pct_delta_price']:+.1f}%")
-m3.metric("Доля аномалий", f"{summary['anomaly_rate']:.1f}%")
-with m4:
-    sub_matched, sub_only = st.columns(2)
-    sub_matched.metric("Совпало", summary["n_matched"])
-    sub_only.metric("Только А / Б", f"{summary['n_only_in_a']} / {summary['n_only_in_b']}")
-st.divider()
-
-# 4. SPLIT-SCREEN
-left, right = st.columns(2)
-with left:
-    st.subheader("Лист А — Дочерняя компания А")
-    render_sheet(_build_sheet(matched, result["only_in_a"], "a"))
-with right:
-    st.subheader("Лист Б — Дочерняя компания Б")
-    render_sheet(_build_sheet(matched, result["only_in_b"], "b"))
-st.divider()
-
-# 5. DELTA TABLE + Pareto
-st.subheader("Таблица расхождений (совпавшие позиции)")
-render_delta_table(matched)
-if len(matched) >= 2:
-    st.caption(
-        f"Топ-2 позиции объясняют {matched['cumulative_pct'].iloc[1]:.1f}% суммарного отклонения"
+# First-run action: build the synthetic group warehouse explicitly so a new user
+# knows exactly what to click before opening the Чат / Аналитика tabs.
+if st.button("Загрузить демо-данные", type="primary"):
+    init_group_warehouse()
+    st.session_state["group_loaded"] = True
+if st.session_state.get("group_loaded"):
+    st.success(
+        "Демо-данные группы загружены — вкладки «Чат с данными» и "
+        "«Аналитика по группе» готовы к работе."
     )
 st.divider()
 
-# 6. MISSING / NEW ROWS
-only_left, only_right = st.columns(2)
-with only_left:
-    st.subheader("Только в листе А (отсутствуют в Б)")
-    if len(result["only_in_a"]) == 0:
-        st.success("Все позиции листа А присутствуют в листе Б")
-    else:
-        render_only_in(result["only_in_a"], ONLY_A)
-with only_right:
-    st.subheader("Только в листе Б (новые позиции)")
-    if len(result["only_in_b"]) == 0:
-        st.success("Все позиции листа Б присутствуют в листе А")
-    else:
-        render_only_in(result["only_in_b"], ONLY_B)
-st.divider()
+tab_compare, tab_chat, tab_analytics = st.tabs(
+    ["Сравнение листов", "Чат с данными", "Аналитика по группе"]
+)
 
-# 7. ROLLUPS
-with st.expander("Разбивка по поставщикам", expanded=False):
-    render_rollup(result["supplier_rollup"], "supplier", "Поставщик")
-with st.expander("Разбивка по категориям", expanded=False):
-    render_rollup(result["category_rollup"], "category", "Категория")
+# Chat and analytics tabs are drawn before the comparison tab because the
+# comparison flow calls st.stop() on missing input, which halts the whole script.
+with tab_chat:
+    render_chat_tab()
 
-# 8. FOOTER
-st.divider()
-st.caption("Аудит IT-бюджетов · MVP v1.0")
+with tab_analytics:
+    render_analytics_tab()
+
+with tab_compare:
+    render_comparison_tab()

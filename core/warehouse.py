@@ -177,6 +177,57 @@ per-year, or per-category breakdowns.
 """
 
 
+# --- group analytics aggregations --------------------------------------------
+# Named SUM/GROUP BY helpers for the "Аналитика по группе" dashboard. Kept here
+# (not in app.py) per the architecture rule: all SQL/aggregation lives in core.
+
+
+def get_group_summary(db_path: str = "procurement.db") -> dict:
+    """Return headline group figures: total spend, subsidiary count, year count."""
+    row = run_sql(
+        "SELECT SUM(subtotal) AS total_spend, "
+        "COUNT(DISTINCT subsidiary) AS n_subsidiaries, "
+        "COUNT(DISTINCT year) AS n_years "
+        "FROM procurements",
+        db_path,
+    ).iloc[0]
+    return {
+        "total_spend": float(row["total_spend"]),
+        "n_subsidiaries": int(row["n_subsidiaries"]),
+        "n_years": int(row["n_years"]),
+    }
+
+
+def get_yearly_totals(db_path: str = "procurement.db") -> pd.DataFrame:
+    """Total group spend per year, ordered by year ascending (columns: year, total_spend)."""
+    return run_sql(
+        "SELECT year, SUM(subtotal) AS total_spend "
+        "FROM procurements GROUP BY year ORDER BY year",
+        db_path,
+    )
+
+
+def get_subsidiary_totals_for_year(year: int, db_path: str = "procurement.db") -> pd.DataFrame:
+    """Total spend per subsidiary for one year, descending (columns: subsidiary, total_spend)."""
+    return run_sql(
+        "SELECT subsidiary, SUM(subtotal) AS total_spend "
+        f"FROM procurements WHERE year = {int(year)} "
+        "GROUP BY subsidiary ORDER BY total_spend DESC",
+        db_path,
+    )
+
+
+def get_subsidiary_totals(db_path: str = "procurement.db") -> pd.DataFrame:
+    """Total spend per subsidiary across all years, ranked (columns: rank, subsidiary, total_spend)."""
+    df = run_sql(
+        "SELECT subsidiary, SUM(subtotal) AS total_spend "
+        "FROM procurements GROUP BY subsidiary ORDER BY total_spend DESC",
+        db_path,
+    )
+    df.insert(0, "rank", range(1, len(df) + 1))
+    return df
+
+
 if __name__ == "__main__":
     from core.synth import generate_group
 
