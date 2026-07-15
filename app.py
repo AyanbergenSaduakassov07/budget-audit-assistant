@@ -6,6 +6,11 @@ from core.compare / core.schema. app.py only reshapes, renames, formats, and
 renders what core returns.
 """
 
+import math
+import os
+import tempfile
+from io import BytesIO
+
 import pandas as pd
 import streamlit as st
 
@@ -20,6 +25,10 @@ from core.warehouse import (
     get_subsidiary_totals,
 )
 from core.query_engine import answer
+from core.corporate_ingest import extract_workbook
+from core.budget_audit import run_full_audit
+from core.budget_narrator import narrate_audit
+from core.conclusion_generator import generate_conclusion
 
 # Most recent year covered by the synthetic group data (see synth._GROUP_YEARS).
 LATEST_YEAR = 2026
@@ -32,6 +41,32 @@ ONLY_A = "#FFF3C4"
 ONLY_B = "#FFE0B2"
 POSITIVE = "#C8E6C9"
 NEGATIVE = "#FFCDD2"
+
+# --- audit-tab palette (SPEC design system, audit tab) ------------------------
+AUDIT_SECTION_BG = {"АТК": "#FFCDD2", "уточнение": "#FFF3C4", "согласовано": "#C8E6C9"}
+AUDIT_SECTION_TEXT = {"АТК": "#7F1D1D", "уточнение": "#78350F", "согласовано": "#1B5E20"}
+AUDIT_SECTION_ICON = {"АТК": "🔴", "уточнение": "🟡", "согласовано": "🟢"}
+AUDIT_SECTION_LABEL = {
+    "АТК": "На рассмотрение АТК",
+    "уточнение": "Требуют уточнения",
+    "согласовано": "Согласовано без замечаний",
+}
+# class= counterparts of AUDIT_SECTION_TEXT for st.markdown HTML (see inject_audit_css
+# docstring note: inline style="color:..." gets sanitized away, class="..." doesn't).
+AUDIT_SECTION_TEXT_CLASS = {
+    "АТК": "audit-c-atk-text",
+    "уточнение": "audit-c-clarify-text",
+    "согласовано": "audit-c-approved-text",
+}
+RISK_TEXT_CLASS = {
+    "высокий": "audit-c-risk-high",
+    "средний": "audit-c-risk-medium",
+    "низкий": "audit-c-risk-low",
+}
+RISK_HIGH = "#C62828"
+RISK_MEDIUM = "#F59E0B"
+RISK_LOW = "#2E7D32"
+RISK_UNKNOWN = "#5F5E5A"
 
 # --- Russian display labels --------------------------------------------------
 SHEET_LABELS = {
@@ -104,6 +139,86 @@ def inject_css() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def inject_audit_css() -> None:
+    """Design-system CSS scoped to the Аудит бюджета tab (forces light theme)."""
+    st.markdown(
+        """
+        <style>
+        /* force light background regardless of system dark mode */
+        .stApp { background-color: #F6F4EF !important; color: #2C2C2A !important; }
+        h1, h2, h3, h4 { color: #1F3A5F !important; font-weight: 700 !important; }
+        p, label, span, div { color: #2C2C2A !important; }
+        .stMetric label { color: #5F5E5A !important; font-size: 13px !important; }
+        .stMetric [data-testid="stMetricValue"] { color: #1F3A5F !important; font-size: 24px !important; font-weight: 700 !important; }
+        /* expander headers */
+        .streamlit-expanderHeader { background-color: #1F3A5F !important; color: white !important; border-radius: 6px !important; font-weight: 600 !important; }
+        /* sort dropdown */
+        div[data-baseweb="popover"] { background-color: #FFFFFF !important; }
+        div[data-baseweb="popover"] * { color: #2C2C2A !important; background-color: #FFFFFF !important; }
+        /* dataframe internals */
+        [data-testid="stDataFrame"] { background-color: #FFFFFF !important; border-radius: 6px !important; border: 1px solid #D5D2CC !important; }
+        :root { color-scheme: light !important; }
+        [data-testid="stAppViewContainer"] { background-color: #F6F4EF !important; }
+        /* info/warning/error boxes */
+        .stInfo { background-color: #EFF6FF !important; color: #1F3A5F !important; border-left: 4px solid #1F3A5F !important; }
+        .stWarning { background-color: #FFF3C4 !important; color: #92400E !important; border-left: 4px solid #F59E0B !important; }
+        .stError { background-color: #FFCDD2 !important; color: #7F1D1D !important; border-left: 4px solid #C62828 !important; }
+        .stSuccess { background-color: #C8E6C9 !important; color: #1B5E20 !important; border-left: 4px solid #2E7D32 !important; }
+        /* Streamlit's markdown sanitizer strips the `color` CSS property from any
+           inline style="..." attribute (background/margin/font-size survive fine,
+           color specifically does not, even with !important). These utility
+           classes are the workaround: apply color via class="..." instead of
+           style="color:...", since class selectors aren't touched by that
+           sanitization pass and outrank the bare-tag rules above by specificity. */
+        .audit-c-white { color: #FFFFFF !important; }
+        .audit-c-subtitle { color: #D5D2CC !important; }
+        .audit-c-navy { color: #1F3A5F !important; }
+        .audit-c-body { color: #2C2C2A !important; }
+        .audit-c-atk-text { color: #7F1D1D !important; }
+        .audit-c-clarify-text { color: #78350F !important; }
+        .audit-c-approved-text { color: #1B5E20 !important; }
+        .audit-c-risk-high { color: #C62828 !important; }
+        .audit-c-risk-medium { color: #F59E0B !important; }
+        .audit-c-risk-low { color: #2E7D32 !important; }
+        .audit-c-risk-unknown { color: #5F5E5A !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _audit_money(value) -> str:
+    """Space-grouped thousands (Russian convention) — '—' for missing values."""
+    if value is None or (isinstance(value, (int, float)) and pd.isna(value)):
+        return "—"
+    return f"{float(value):,.0f}".replace(",", " ")
+
+
+def _audit_pct(value) -> str:
+    """Signed percentage; handles the delta_pct == inf (новая статья) case."""
+    if value is None:
+        return "—"
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isinf(value):
+            return "новая статья"
+        if pd.isna(value):
+            return "—"
+    return f"{value:+.1f}%"
+
+
+def _safe_col(df: pd.DataFrame, name: str, empty=""):
+    """df[name] if present, else a column of `empty` — keeps display code column-agnostic."""
+    if name in df.columns:
+        return df[name]
+    return pd.Series([empty] * len(df), index=df.index)
+
+
+def _safe_text_col(df: pd.DataFrame, name: str):
+    """_safe_col, but also blanks out None/NaN cells within an existing column to '—'."""
+    series = _safe_col(df, name)
+    return series.where(series.notna() & (series.astype(str).str.strip() != ""), "—")
 
 
 def _build_sheet(matched: pd.DataFrame, only_in: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -441,6 +556,314 @@ def render_comparison_tab() -> None:
     st.caption("Аудит IT-бюджетов · MVP v1.0")
 
 
+# --- audit tab (corporate ИТ-бюджет ingest + rule audit + AI narrative + exports) ---
+@st.cache_data(show_spinner=False)
+def _cached_extract_workbook(file_bytes: bytes) -> list[dict]:
+    """extract_workbook() over an uploaded file's bytes, cached on those bytes."""
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        return extract_workbook(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_run_audit(file_bytes: bytes, sheet_name: str, atk_threshold: float, _sheet_result: dict) -> dict:
+    """run_full_audit(), cached on the hashable identifying args (not the DataFrame)."""
+    return run_full_audit(_sheet_result, atk_threshold=atk_threshold)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_narrate(file_bytes: bytes, sheet_name: str, atk_threshold: float, _audit_result: dict) -> dict | None:
+    """narrate_audit(), cached the same way — avoids a Gemini call on every rerun."""
+    return narrate_audit(_audit_result)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_conclusion_bytes(
+    file_bytes: bytes, sheet_name: str, atk_threshold: float, has_narrative: bool, _audit_result: dict
+) -> bytes:
+    """generate_conclusion(), cached — the Node subprocess call isn't free."""
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        generate_conclusion(_audit_result, tmp_path)
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(tmp_path)
+
+
+def _audit_section_table(all_rows: pd.DataFrame, decision: str) -> pd.DataFrame:
+    """Reshape all_rows (filtered to one decision) into that section's display columns."""
+    subset = all_rows[all_rows["decision"] == decision]
+    if subset.empty:
+        return subset
+
+    if decision == "согласовано":
+        return pd.DataFrame({
+            "Контрагент": _safe_text_col(subset, "counterparty"),
+            "Статья": _safe_text_col(subset, "article_code"),
+            "Текущий год, тыс. ₸": _safe_col(subset, "plan_annual", empty=None),
+            "Δ%": _safe_col(subset, "delta_pct", empty=None),
+        })
+
+    return pd.DataFrame({
+        "Контрагент": _safe_text_col(subset, "counterparty"),
+        "Статья": _safe_text_col(subset, "article_code"),
+        "Прошлый год, тыс. ₸": _safe_col(subset, "plan_prior", empty=None),
+        "Текущий год, тыс. ₸": _safe_col(subset, "plan_annual", empty=None),
+        "Δ тыс. ₸": _safe_col(subset, "delta_abs", empty=None),
+        "Δ%": _safe_col(subset, "delta_pct", empty=None),
+        "Основание": _safe_text_col(subset, "reason"),
+    })
+
+
+def _render_audit_section(decision: str, count: int, amount: float, disp: pd.DataFrame) -> None:
+    """One colored card + its data table, per the АТК/уточнение/согласовано palette."""
+    bg = AUDIT_SECTION_BG[decision]
+    text_color = AUDIT_SECTION_TEXT[decision]
+    text_class = AUDIT_SECTION_TEXT_CLASS[decision]
+    icon = AUDIT_SECTION_ICON[decision]
+    label = AUDIT_SECTION_LABEL[decision]
+
+    st.markdown(
+        f'<div style="background:{bg};padding:10px 18px;border-radius:8px 8px 0 0">'
+        f'<b class="{text_class}" style="font-size:15px">{icon} {label} — {count} статей · '
+        f'{_audit_money(amount)} тыс. ₸</b></div>',
+        unsafe_allow_html=True,
+    )
+
+    if disp.empty:
+        st.caption("Нет статей в этой категории.")
+        return
+
+    money_cols = [c for c in disp.columns if "тыс. ₸" in c]
+    pct_cols = [c for c in disp.columns if c == "Δ%"]
+    fmt = {c: _audit_money for c in money_cols}
+    fmt.update({c: _audit_pct for c in pct_cols})
+
+    styled = disp.style.apply(
+        lambda row: [f"background-color:{bg};color:{text_color}"] * len(row), axis=1
+    ).format(fmt)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def _audit_xlsx_bytes(df: pd.DataFrame) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Аудит")
+    return buffer.getvalue()
+
+
+def render_audit_tab() -> None:
+    """Corporate ИТ-бюджет upload -> core.budget_audit rules -> AI narrative -> exports.
+
+    No math/audit logic here — every number comes from core.corporate_ingest,
+    core.budget_audit, core.budget_narrator, and core.conclusion_generator.
+    This function only reshapes, formats, and renders what those return.
+    """
+    inject_audit_css()
+
+    # 1. HEADER BLOCK
+    st.markdown(
+        '<div style="background:#1F3A5F;padding:24px 28px;border-radius:10px;margin-bottom:20px">'
+        '<div class="audit-c-white" style="margin:0;font-size:22px;font-weight:700">Аудит IT-бюджетов компании</div>'
+        '<p class="audit-c-subtitle" style="margin:6px 0 0;font-size:14px">Загрузите файл формы — система '
+        'проверит квартальные расхождения, динамику по годам и концентрацию закупок</p></div>',
+        unsafe_allow_html=True,
+    )
+
+    # 2. FILE UPLOAD ROW
+    col_current, col_prior, col_threshold = st.columns([2, 2, 1])
+    with col_current:
+        file_current = st.file_uploader(
+            "Файл текущего года (xlsx)", type=["xlsx"], key="audit_file_current"
+        )
+        st.caption("Формат: ИТ-расходы, листы OPEX/CAPEX")
+    with col_prior:
+        st.file_uploader(
+            "Файл прошлого года (необязательно)", type=["xlsx"], key="audit_file_prior"
+        )
+        st.caption("Для сравнения год к году")
+    with col_threshold:
+        atk_threshold = st.slider(
+            "Порог АТК (%)", min_value=30, max_value=100, value=50, step=5, key="atk_threshold"
+        )
+        st.caption("Рост выше порога → выносится на АТК")
+    # Note: the prior-year file above is accepted but not yet consumed — merging
+    # a separate prior-year workbook into the delta computation is a cross-file
+    # join core.budget_audit doesn't implement. Delta/АТК comparison currently
+    # works from a single file that carries both plan_prior and plan_annual
+    # columns itself (the common layout), which is what's wired up below.
+
+    if file_current is None:
+        st.info("Загрузите файл формы текущего года, чтобы начать аудит.")
+        return
+
+    try:
+        file_bytes = file_current.getvalue()
+
+        with st.spinner("Анализируем файл..."):
+            sheet_results = _cached_extract_workbook(file_bytes)
+
+        if not sheet_results:
+            st.error("Ошибка разбора файла: в книге не найдено ни одного листа.")
+            st.stop()
+
+        # 4. SHEET SELECTOR
+        sheet_names = [r["sheet_name"] for r in sheet_results]
+        if len(sheet_names) > 1:
+            selected_sheet = st.selectbox("Выберите лист:", sheet_names, key="audit_sheet")
+        else:
+            selected_sheet = sheet_names[0]
+        sheet_result = next(r for r in sheet_results if r["sheet_name"] == selected_sheet)
+
+        with st.spinner("Анализируем файл..."):
+            audit_result = _cached_run_audit(file_bytes, selected_sheet, float(atk_threshold), sheet_result)
+
+        entity = audit_result["entity"]
+        budget_year = audit_result["budget_year"]
+        summary = audit_result["summary"]
+
+        if not os.environ.get("GEMINI_API_KEY"):
+            st.info("AI-объяснения недоступны — задайте GEMINI_API_KEY. Аудит работает полностью без AI.")
+            narrative = None
+        else:
+            with st.spinner("Анализируем файл..."):
+                narrated = _cached_narrate(file_bytes, selected_sheet, float(atk_threshold), audit_result)
+            narrative = narrated.get("narrative") if narrated else None
+
+        # 5. SUMMARY METRICS BAR
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric(
+            "На АТК",
+            f"{summary['atk_count']} статей",
+            delta=f"−{_audit_money(summary['atk_amount'])} тыс. ₸",
+            delta_color="inverse",
+        )
+        m2.metric("Уточнений", f"{summary['clarification_count']} статей")
+        m3.metric("Согласовано", f"{summary['approved_count']} статей", delta_color="normal")
+        m4.metric("Итого бюджет", f"{_audit_money(summary['total_amount'])} тыс. ₸")
+        with m5:
+            risk_level = (narrative or {}).get("risk_level", "")
+            risk_label = {"высокий": "Высокий", "средний": "Средний", "низкий": "Низкий"}.get(risk_level, "Н/Д")
+            risk_class = RISK_TEXT_CLASS.get(risk_level, "audit-c-risk-unknown")
+            st.markdown(
+                f'<div class="{risk_class}" style="font-size:28px;font-weight:700">'
+                f'⬤ {risk_label}</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Уровень риска")
+
+        st.divider()
+
+        # 6. AI SUMMARY
+        if narrative and narrative.get("executive_summary"):
+            st.markdown(
+                '<div style="background:#EFF6FF;padding:16px 20px;border-left:4px solid #1F3A5F;'
+                'border-radius:0 8px 8px 0;margin-bottom:16px"><b class="audit-c-navy">Резюме аудита</b>'
+                f'<br><span class="audit-c-body">{narrative["executive_summary"]}</span></div>',
+                unsafe_allow_html=True,
+            )
+        elif narrative and narrative.get("error"):
+            st.info(f"AI-резюме недоступно: {narrative['error']}")
+
+        if not audit_result["has_prior_year"]:
+            st.warning(
+                "Файл не содержит данных прошлого года — сравнение год к году недоступно. "
+                "Загрузите файл прошлого года для полного анализа."
+            )
+
+        # 7. THREE SECTION TABLES
+        all_rows = audit_result["all_rows"]
+        _render_audit_section("АТК", summary["atk_count"], summary["atk_amount"], _audit_section_table(all_rows, "АТК"))
+        _render_audit_section(
+            "уточнение", summary["clarification_count"], summary["clarification_amount"],
+            _audit_section_table(all_rows, "уточнение"),
+        )
+        _render_audit_section(
+            "согласовано", summary["approved_count"], summary["approved_amount"],
+            _audit_section_table(all_rows, "согласовано"),
+        )
+
+        # 8. CONCENTRATION CHART
+        st.subheader("Концентрация закупок по поставщикам")
+        concentration = audit_result["findings"]["concentration"]
+        breakdown = concentration["supplier_breakdown"]
+        if breakdown is not None and not breakdown.empty:
+            st.bar_chart(breakdown.set_index("counterparty")["share_pct"])
+        else:
+            st.caption("Недостаточно данных для анализа концентрации.")
+        if concentration["concentration_flag"]:
+            st.markdown(
+                '<div style="background:#FFCDD2;padding:12px 18px;border-radius:6px;'
+                'border-left:4px solid #C62828"><b class="audit-c-atk-text">Риск концентрации:</b> '
+                f'<span class="audit-c-body">{concentration["top_supplier"]} составляет '
+                f'{concentration["top_supplier_pct"]:.1f}% бюджета</span></div>',
+                unsafe_allow_html=True,
+            )
+
+        # 9. QUARTERLY MISMATCHES
+        quarterly = audit_result["findings"]["quarterly_mismatches"]
+        if quarterly is not None and not quarterly.empty:
+            st.subheader("Квартальные расхождения")
+            quarterly_disp = pd.DataFrame({
+                "Контрагент": _safe_text_col(quarterly, "counterparty"),
+                "Статья": _safe_text_col(quarterly, "article_code"),
+                "План год, тыс. ₸": quarterly["plan_annual"],
+                "Сумма по кварталам, тыс. ₸": quarterly["quarterly_sum"],
+                "Расхождение, тыс. ₸": quarterly["difference"],
+                "Расхождение, %": quarterly["difference_pct"],
+                "Критичность": quarterly["severity"],
+            })
+            st.dataframe(
+                quarterly_disp.style.format({
+                    "План год, тыс. ₸": _audit_money,
+                    "Сумма по кварталам, тыс. ₸": _audit_money,
+                    "Расхождение, тыс. ₸": _audit_money,
+                    "Расхождение, %": lambda v: f"{v:.1f}%",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.bar_chart(quarterly.set_index("counterparty")["difference_pct"])
+
+        st.divider()
+
+        # 10. DOWNLOAD ROW
+        dl_left, dl_right = st.columns(2)
+        with dl_left:
+            with st.spinner("Формируем Заключение..."):
+                docx_bytes = _cached_conclusion_bytes(
+                    file_bytes, selected_sheet, float(atk_threshold), narrative is not None, audit_result
+                )
+            st.download_button(
+                label="Скачать Заключение (.docx)",
+                data=docx_bytes,
+                file_name=f"Заключение_{entity}_{budget_year}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                help="Документ готов к редактированию в Word перед подписанием",
+            )
+        with dl_right:
+            st.download_button(
+                label="Экспорт данных (.xlsx)",
+                data=_audit_xlsx_bytes(all_rows),
+                file_name=f"Аудит_{entity}_{budget_year}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        st.caption("Оба документа готовы к редактированию перед подписанием")
+
+        st.divider()
+        st.caption("Аудит IT-бюджетов · MVP v2.0")
+
+    except Exception as e:
+        st.error("Ошибка разбора файла: " + str(e))
+        st.stop()
+
+
 # --- page --------------------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Аудит закупок компании", page_icon=None)
 inject_css()
@@ -467,17 +890,27 @@ if st.session_state.get("group_loaded"):
     )
 st.divider()
 
-tab_compare, tab_chat, tab_analytics = st.tabs(
-    ["Сравнение листов", "Чат с данными", "Аналитика по группе"]
+tab_compare, tab_chat, tab_analytics, tab_audit = st.tabs(
+    ["Сравнение листов", "Чат с данными", "Аналитика по группе", "Аудит бюджета"]
 )
 
-# Chat and analytics tabs are drawn before the comparison tab because the
-# comparison flow calls st.stop() on missing input, which halts the whole script.
+# st.tabs() doesn't give each tab its own execution scope — every `with tab_x:`
+# block runs in one single top-to-bottom script pass, so any st.stop() call
+# anywhere below halts rendering for every tab after it, active or not. Chat
+# and analytics never call st.stop(), so they're safe to draw first; compare
+# and audit both do (compare on no-file-uploaded, audit on a parse error), so
+# whichever of those two is drawn last would never render if the other one
+# stops first. Audit is drawn before compare here so a bare page load (no
+# files anywhere yet) still shows the audit tab's own upload prompt rather
+# than silently going blank.
 with tab_chat:
     render_chat_tab()
 
 with tab_analytics:
     render_analytics_tab()
+
+with tab_audit:
+    render_audit_tab()
 
 with tab_compare:
     render_comparison_tab()

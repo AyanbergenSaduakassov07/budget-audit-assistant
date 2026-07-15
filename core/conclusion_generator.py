@@ -11,22 +11,20 @@ the fixed Russian section text) happens here in Python; scripts/render_conclusio
 only lays out a pre-built JSON payload with the docx package. That keeps the
 one Node dependency this project has to a thin rendering layer.
 
-Two rule/data gaps worth flagging in code, since they affect what shows up
-in the printed document:
+Row-level "Основание"/"Суть уточнения" text is read from
+audit_result["all_rows"]["reason"] — budget_audit.run_full_audit() already
+knows which rule claimed each row when it builds atk_idx/utochnenie_idx, so
+that's where the wording is decided (once, in one place) rather than
+re-derived here per row-source.
 
-1. Row-level "Основание"/"Суть уточнения" wording for section 1 and the
-   growth-flag rows of section 2 isn't specified beyond the уточнение
-   growth formula ("+{delta_pct:.0f}% к прошлому году") — the equivalent
-   ATK-section wording was left to be designed here.
-2. A row can be flagged by budget_audit.run_full_audit() as уточнение
-   *solely* via a critical quarterly mismatch, but that source wasn't
-   listed among section 2's population rules (growth_flags/missing_fields/
-   new_items only). Omitting it would leave the printed уточнение table
-   short of the authoritative summary["clarification_count"] it's captioned
-   with, so quarterly-mismatch rows are included here too — with their own
-   "расхождение по кварталам" reason text — whenever run_full_audit's own
-   priority resolution (all_rows["decision"]) confirms they landed on
-   уточнение rather than getting absorbed into АТК.
+One data gap worth flagging: a row can be flagged as уточнение *solely* via
+a critical quarterly mismatch, but that source wasn't listed among section
+2's population rules (growth_flags/missing_fields/new_items only). Omitting
+it would leave the printed уточнение table short of the authoritative
+summary["clarification_count"] it's captioned with, so quarterly-mismatch
+rows are included here too, whenever run_full_audit's own priority
+resolution (all_rows["decision"]) confirms they landed on уточнение rather
+than getting absorbed into АТК.
 
 Per SPEC.md architecture rule: this module is pure — no streamlit imports.
 """
@@ -44,7 +42,6 @@ import pandas as pd
 
 _RENDER_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "render_conclusion.js"
 
-_NEW_ITEM_FLAG = "новая статья"
 _ATK_DECISION = "АТК"
 _CLARIFICATION_DECISION = "уточнение"
 _APPROVED_DECISION = "согласовано"
@@ -81,26 +78,28 @@ def _final_decision(all_rows: pd.DataFrame | None, idx) -> str | None:
     return all_rows.loc[idx, "decision"]
 
 
+def _reason_for(all_rows: pd.DataFrame | None, idx) -> str:
+    """The reason run_full_audit recorded for this row (see module docstring)."""
+    if all_rows is None or "reason" not in all_rows.columns or idx not in all_rows.index:
+        return ""
+    return _clean_text(all_rows.loc[idx, "reason"])
+
+
 # --- section 1: АТК --------------------------------------------------------------
 def _atk_rows(audit_result: dict) -> list[dict]:
     findings = audit_result.get("findings", {}) or {}
+    all_rows = audit_result.get("all_rows")
     sheet_name = audit_result.get("sheet_name", "")
     rows: list[dict] = []
 
     growth = findings.get("growth_flags")
     if growth is not None and not growth.empty:
-        for _, r in growth[growth["decision"] == _ATK_DECISION].iterrows():
-            is_new = _clean_text(r.get("delta_flag")) == _NEW_ITEM_FLAG
-            reason = (
-                "новая статья бюджета"
-                if is_new
-                else f"рост +{r.get('delta_pct', 0):.0f}% к прошлому году"
-            )
+        for idx, r in growth[growth["decision"] == _ATK_DECISION].iterrows():
             rows.append({
                 "tab": sheet_name,
                 "item": _item_label(r),
                 "amount": _format_amount(r.get("plan_annual")),
-                "reason": reason,
+                "reason": _reason_for(all_rows, idx),
             })
 
     concentration = findings.get("concentration", {}) or {}
@@ -132,12 +131,12 @@ def _clarification_rows(audit_result: dict) -> list[dict]:
 
     growth = findings.get("growth_flags")
     if growth is not None and not growth.empty:
-        for _, r in growth[growth["decision"] == _CLARIFICATION_DECISION].iterrows():
+        for idx, r in growth[growth["decision"] == _CLARIFICATION_DECISION].iterrows():
             rows.append({
                 "tab": sheet_name,
                 "item": _item_label(r),
                 "amount": _format_amount(r.get("plan_annual")),
-                "reason": f"+{r.get('delta_pct', 0):.0f}% к прошлому году",
+                "reason": _reason_for(all_rows, idx),
             })
 
     missing = findings.get("missing_fields")
@@ -149,7 +148,7 @@ def _clarification_rows(audit_result: dict) -> list[dict]:
                 "tab": sheet_name,
                 "item": _item_label(r),
                 "amount": _format_amount(r.get("plan_annual")),
-                "reason": f"не заполнено: {_clean_text(r.get('missing_fields'))}",
+                "reason": _reason_for(all_rows, idx),
             })
 
     new_items = findings.get("new_items")
@@ -161,12 +160,12 @@ def _clarification_rows(audit_result: dict) -> list[dict]:
                 "tab": sheet_name,
                 "item": _item_label(r),
                 "amount": _format_amount(r.get("plan_annual")),
-                "reason": _clean_text(r.get("recommendation")),
+                "reason": _reason_for(all_rows, idx),
             })
 
-    # See module docstring, gap 2: without this, a row flagged solely by a
-    # critical quarterly mismatch would count toward the footer but never
-    # appear in the table above it.
+    # See module docstring: without this, a row flagged solely by a critical
+    # quarterly mismatch would count toward the footer but never appear in
+    # the table above it.
     quarterly = findings.get("quarterly_mismatches")
     if quarterly is not None and not quarterly.empty:
         critical = quarterly[quarterly["severity"] == "critical"]
@@ -177,7 +176,7 @@ def _clarification_rows(audit_result: dict) -> list[dict]:
                 "tab": sheet_name,
                 "item": _item_label(r),
                 "amount": _format_amount(r.get("plan_annual")),
-                "reason": f"расхождение по кварталам: {r.get('difference_pct', 0):.0f}%",
+                "reason": _reason_for(all_rows, idx),
             })
 
     return rows

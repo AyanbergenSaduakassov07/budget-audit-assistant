@@ -77,8 +77,12 @@ def quarterly_reconciliation(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --- RULE 2: year-over-year analysis -------------------------------------------
-def year_over_year_analysis(df: pd.DataFrame) -> pd.DataFrame:
-    """Classify rows by delta_pct/delta_flag; return the АТК / уточнение ones."""
+def year_over_year_analysis(df: pd.DataFrame, atk_threshold: float = 50.0) -> pd.DataFrame:
+    """Classify rows by delta_pct/delta_flag; return the АТК / уточнение ones.
+
+    atk_threshold is the growth-% cutoff above which a row goes to АТК instead
+    of уточнение (уточнение stays the fixed (20, atk_threshold] band below it).
+    """
     out_columns = [
         "counterparty", "article_code", "expense_type",
         "plan_prior", "plan_annual", "delta_abs", "delta_pct", "delta_flag", "decision",
@@ -95,10 +99,10 @@ def year_over_year_analysis(df: pd.DataFrame) -> pd.DataFrame:
     no_comparison = delta_flag == _NO_PRIOR_YEAR_FLAG
 
     # new_item rows carry delta_pct == inf, which would also satisfy a bare
-    # ">50" check — exclude them from the generic growth clause so the
-    # plan_annual-based new-item thresholds (below) are the ones that decide.
-    cond_atk = (~new_item & (delta_pct > 50)) | (new_item & (plan_annual > 100_000))
-    cond_utochnenie_growth = ~new_item & delta_pct.between(20, 50, inclusive="right")
+    # ">atk_threshold" check — exclude them from the generic growth clause so
+    # the plan_annual-based new-item thresholds (below) are the ones that decide.
+    cond_atk = (~new_item & (delta_pct > atk_threshold)) | (new_item & (plan_annual > 100_000))
+    cond_utochnenie_growth = ~new_item & delta_pct.gt(20) & delta_pct.le(atk_threshold)
     cond_utochnenie_new = new_item & (plan_annual <= 100_000)
 
     decision = pd.Series("норма", index=work.index, dtype=object)
@@ -208,42 +212,68 @@ def new_line_items(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --- RULE 6: full audit ---------------------------------------------------------
-def run_full_audit(sheet_result: dict) -> dict:
-    """Run all five rules over one extract_sheet() result and classify every row."""
+def run_full_audit(sheet_result: dict, atk_threshold: float = 50.0) -> dict:
+    """Run all five rules over one extract_sheet() result and classify every row.
+
+    atk_threshold: growth-% cutoff passed through to year_over_year_analysis
+    (see that docstring). Defaults to 50, matching the original fixed rule.
+    """
     canonical = canonicalize(sheet_result["data"])
 
     quarterly_mismatches = quarterly_reconciliation(canonical)
-    growth_flags = year_over_year_analysis(canonical)
+    growth_flags = year_over_year_analysis(canonical, atk_threshold=atk_threshold)
     concentration = concentration_risk(canonical)
     missing = missing_fields(canonical)
     new_items = new_line_items(canonical)
 
     atk_idx: set = set()
     utochnenie_idx: set = set()
+    # First rule to claim a row also names why — later rules can still add the
+    # row to atk_idx/utochnenie_idx (for correct bucket membership) but won't
+    # overwrite an already-assigned reason. Order here is the display priority:
+    # new-item size > growth % > missing fields > quarterly > concentration.
+    # (new-item rows carry delta_pct == inf — RULE5's amount-tiered
+    # recommendation is both more informative and avoids formatting inf as a
+    # percentage, so it's claimed before the generic growth-% phrasing below.)
+    reasons: dict = {}
 
     if not growth_flags.empty:
         atk_idx |= set(growth_flags.index[growth_flags["decision"] == "АТК"])
         utochnenie_idx |= set(growth_flags.index[growth_flags["decision"] == "уточнение"])
+        for idx, r in growth_flags.iterrows():
+            if r["delta_flag"] == _NEW_ITEM_FLAG:
+                continue  # claimed by the new_items loop below instead
+            pct = r["delta_pct"]
+            reasons.setdefault(idx, f"{'рост ' if r['decision'] == 'АТК' else ''}+{pct:.0f}% к прошлому году")
 
     if not new_items.empty:
         amount = pd.to_numeric(new_items["plan_annual"], errors="coerce")
         large = amount > 500_000
         atk_idx |= set(new_items.index[large])
         utochnenie_idx |= set(new_items.index[~large])
+        for idx, r in new_items.iterrows():
+            reasons.setdefault(idx, r["recommendation"])
 
     if not missing.empty:
         utochnenie_idx |= set(missing.index)
+        for idx, r in missing.iterrows():
+            reasons.setdefault(idx, f"не заполнено: {r['missing_fields']}")
 
     if not quarterly_mismatches.empty:
-        utochnenie_idx |= set(
-            quarterly_mismatches.index[quarterly_mismatches["severity"] == "critical"]
-        )
+        critical = quarterly_mismatches[quarterly_mismatches["severity"] == "critical"]
+        utochnenie_idx |= set(critical.index)
+        for idx, r in critical.iterrows():
+            reasons.setdefault(idx, f"расхождение по кварталам: {r['difference_pct']:.0f}%")
 
     breakdown = concentration["supplier_breakdown"]
     if not breakdown.empty and "counterparty" in canonical.columns:
         risky_suppliers = set(breakdown.loc[breakdown["risk_flag"], "counterparty"])
         if risky_suppliers:
-            atk_idx |= set(canonical.index[canonical["counterparty"].isin(risky_suppliers)])
+            top_pct = concentration.get("top_supplier_pct", 0.0)
+            risky_idx = canonical.index[canonical["counterparty"].isin(risky_suppliers)]
+            atk_idx |= set(risky_idx)
+            for idx in risky_idx:
+                reasons.setdefault(idx, f"концентрация поставщика: {top_pct:.0f}% от общего бюджета")
 
     utochnenie_idx -= atk_idx  # АТК outranks уточнение when a row hits both
 
@@ -252,6 +282,7 @@ def run_full_audit(sheet_result: dict) -> dict:
     decision.loc[list(atk_idx)] = "АТК"
     decision.loc[list(utochnenie_idx)] = "уточнение"
     all_rows["decision"] = decision
+    all_rows["reason"] = all_rows.index.map(reasons).fillna("")
 
     def _amount(mask) -> float:
         sub = all_rows.loc[mask, "plan_annual"] if "plan_annual" in all_rows.columns else pd.Series(dtype=float)
