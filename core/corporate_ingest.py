@@ -51,6 +51,30 @@ _MONETARY_KEYWORDS = ("план", "прогноз", "цена")
 
 _METADATA_SCAN_ROWS = 20
 
+# Canonical field -> candidate patterns (matched case-insensitively as regex
+# against each flattened column name, patterns tried in order). Subsidiary
+# workbooks (Subsidiary A, Subsidiary C, ...) disagree on column layout for the same fields, so
+# this is a best-effort detector rather than a fixed positional mapping.
+_CANONICAL_MAPPING: dict[str, list[str]] = {
+    "fact_prior2":   ["2025 год факт", "факт 2025", "Факт 2025"],
+    "plan_prior":    ["2026 год утвержденный план", "план 2026", "утвержденный план 2026", "факт 2026"],
+    "plan_annual":   ["План за 2027", "план 2027", "план за.*год"],
+    "plan_q1":       ["1 кв"],
+    "plan_q2":       ["2 кв"],
+    "plan_q3":       ["3 кв"],
+    "plan_q4":       ["4 кв"],
+    "description":   ["Описание"],
+    "justification": ["Обоснование"],
+    "forecast_y1":   ["Прогноз 2028", "2028"],
+    "forecast_y2":   ["Прогноз 2029", "2029"],
+    "forecast_y3":   ["Прогноз 2030", "2030"],
+    "forecast_y4":   ["Прогноз 2031", "2031"],
+    "counterparty":  ["Контрагент"],
+    "article_code":  ["Статья бюджета", "^Статья$"],
+    "expense_type":  ["Виды затрат"],
+    "contract":      ["Договор"],
+}
+
 
 # --- small cell helpers ------------------------------------------------------
 def _cell_text(value) -> str:
@@ -263,7 +287,80 @@ def flatten_headers(ws, header_row: int, has_nested_header: bool) -> list[str]:
     return names
 
 
-# --- 4. per-sheet extraction -------------------------------------------------
+# --- 4. canonical column detection --------------------------------------------
+def _find_matching_column(columns: list[str], patterns: list[str]) -> str | None:
+    """First existing column matching any pattern, trying patterns in priority order."""
+    for pattern in patterns:
+        regex = re.compile(pattern, re.IGNORECASE)
+        for col in columns:
+            if regex.search(col):
+                return col
+    return None
+
+
+def canonicalize(df: pd.DataFrame) -> pd.DataFrame:
+    """Add canonical field aliases for whichever budget columns this sheet has.
+
+    Different subsidiary workbooks put "current year plan", "prior year plan",
+    quarterly breakdown, etc. in different columns under different Russian
+    labels. This detects whichever of `_CANONICAL_MAPPING`'s fields are present
+    and copies them under a stable name (e.g. df["plan_annual"]). Original
+    columns are left untouched — this only adds aliases, so it's safe to call
+    on any sheet regardless of which fields it has.
+    """
+    out = df.copy()
+    columns = list(df.columns)
+    for canonical_key, patterns in _CANONICAL_MAPPING.items():
+        match = _find_matching_column(columns, patterns)
+        if match is not None:
+            out[canonical_key] = df[match]
+    return out
+
+
+def compute_deltas(df: pd.DataFrame) -> pd.DataFrame:
+    """Add delta_abs / delta_pct / delta_flag from the canonical plan columns.
+
+    Requires canonicalize() to have run first. No-op (returns df unchanged) if
+    plan_annual wasn't detected — there's nothing to compute a delta against.
+    """
+    out = df.copy()
+    if "plan_annual" not in out.columns:
+        return out
+
+    plan_annual = pd.to_numeric(out["plan_annual"], errors="coerce")
+
+    if "plan_prior" not in out.columns:
+        out["delta_abs"] = None
+        out["delta_pct"] = None
+        out["delta_flag"] = "нет данных прошлого года"
+        return out
+
+    plan_prior = pd.to_numeric(out["plan_prior"], errors="coerce")
+
+    delta_pct = pd.Series(index=out.index, dtype="float64")
+    delta_flag = pd.Series("", index=out.index, dtype=object)
+
+    zero_prior = plan_prior == 0
+    has_prior = ~zero_prior
+
+    delta_pct[has_prior] = (
+        (plan_annual[has_prior] - plan_prior[has_prior]) / plan_prior[has_prior] * 100
+    )
+
+    new_item = zero_prior & (plan_annual > 0)
+    delta_pct[new_item] = float("inf")
+    delta_flag[new_item] = "новая статья"
+
+    both_zero = zero_prior & (plan_annual == 0)
+    delta_pct[both_zero] = 0
+
+    out["delta_abs"] = plan_annual - plan_prior
+    out["delta_pct"] = delta_pct
+    out["delta_flag"] = delta_flag
+    return out
+
+
+# --- 5. per-sheet extraction -------------------------------------------------
 def extract_sheet(ws) -> dict:
     """Turn one worksheet into a clean flat DataFrame with scaling + entity applied."""
     metadata = detect_metadata_block(ws)
@@ -304,10 +401,23 @@ def extract_sheet(ws) -> dict:
             f"monetary column(s) by x{unit_scale}: {monetary_names}"
         )
 
-    return {"data": df, "metadata": metadata, "sheet_name": ws.title}
+    df = canonicalize(df)
+    df = compute_deltas(df)
+
+    plan_annual_source = _find_matching_column(columns, _CANONICAL_MAPPING["plan_annual"])
+    budget_year = _to_int(plan_annual_source) if plan_annual_source else None
+
+    return {
+        "data": df,
+        "metadata": metadata,
+        "sheet_name": ws.title,
+        "has_prior_year": "plan_prior" in df.columns,
+        "budget_year": budget_year,
+        "deltas_computed": "delta_flag" in df.columns,
+    }
 
 
-# --- 5. whole-workbook extraction --------------------------------------------
+# --- 6. whole-workbook extraction --------------------------------------------
 def extract_workbook(file_path: str) -> list[dict]:
     """Extract every sheet of a workbook; no assumptions on sheet count or names."""
     wb = openpyxl.load_workbook(file_path, data_only=True)
