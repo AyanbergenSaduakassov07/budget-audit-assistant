@@ -192,6 +192,46 @@ def test_chat_answers_span_whole_file(full_form):
         assert reply and fragment in reply, (question, reply)
 
 
+# --- chat_answer year-availability branches -------------------------------------
+def _no_target_year_workbook(path):
+    """Subsidiary B-style single sheet: campaign year 2027, only a plan_2027 column —
+    no 2025/2026 data at all, so a question about 2026 has no column to hit."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OPEX"
+    _write_meta(ws, campaign_year=2027)
+    hdr = 9
+    _write_headers(ws, hdr, {9: "Контрагент", 11: "План за 2027 год"})
+    r = hdr + 1
+    ws.cell(row=r, column=3, value="IT-OP-01"); ws.cell(row=r, column=4, value="Оборудование")
+    r += 1  # Subsidiary B style: item name at category level, no subcategory
+    ws.cell(row=r, column=7, value="Серверы"); ws.cell(row=r, column=9, value="Dell")
+    ws.cell(row=r, column=11, value=9000)
+    r += 1
+    ws.cell(row=r, column=7, value="СХД"); ws.cell(row=r, column=9, value="HP")
+    ws.cell(row=r, column=11, value=800)
+    ws.cell(row=r + 1, column=3, value="Итого"); ws.cell(row=r + 1, column=11, value=9800)
+    wb.save(path)
+    return path
+
+
+def test_chat_answer_precise_no_data_for_missing_year(tmp_path):
+    meta, _, _, combined = _run_pipeline(_no_target_year_workbook(tmp_path / "subb.xlsx"))
+    reply = chat_answer("план за 2026", combined, meta)
+    assert reply is not None
+    assert "Данных за 2026 год в этом файле нет" in reply
+    assert "2027" in reply  # lists the year that IS present
+    assert "не нашёл" not in reply.lower()  # NOT the generic fallback
+
+
+def test_chat_answer_lists_available_years_for_history_question(tmp_path):
+    meta, _, _, combined = _run_pipeline(_no_target_year_workbook(tmp_path / "subb2.xlsx"))
+    reply = chat_answer("есть ли бюджет за прошлые года", combined, meta)
+    assert reply is not None
+    assert "2027" in reply
+    assert "план" in reply.lower()  # sourced from year_trend()
+
+
 # --- dual plan-year columns (campaign year must win, not column order) ----------
 def test_dual_plan_columns_pick_campaign_year(tmp_path):
     wb = openpyxl.Workbook()

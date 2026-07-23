@@ -9,7 +9,7 @@ so it's a one-line swap to route unmatched questions to an LLM later
 import re
 import pandas as pd
 
-from .parser import _best_baseline_col, year_trend
+from .parser import _best_baseline_col, year_trend, available_years
 
 
 def normalize_unit(unit):
@@ -283,6 +283,33 @@ def chat_answer(question, combined_df, meta):
 
     if any(w in q for w in ["сколько статей", "количество статей"]):
         return f"Всего заполненных статей по файлу: {len(combined_df)} (OPEX: {(combined_df['cost_type']=='OPEX').sum()}, CAPEX: {(combined_df['cost_type']=='CAPEX').sum()})."
+
+    # A specific year was named, but this form carries no plan_/forecast_ column
+    # for it (common on subsidiary forms with a different campaign year). Answer
+    # precisely with the years that ARE present instead of the generic fallback.
+    if year is not None and year_col is None:
+        avail = available_years(combined_df)
+        years_list = ", ".join(str(y) for y in avail) if avail else "нет годовых колонок"
+        return (f"Данных за {year} год в этом файле нет. "
+                f"Доступные годы: {years_list}.")
+
+    # General "what years / prior years are in here" question with no specific
+    # year mentioned — answer from year_trend() (same source as the
+    # «Динамика по годам» chart), listing every факт/план/прогноз year present.
+    has_year_word = "год" in q or "лет" in q
+    if year is None and (
+        ("прошл" in q and has_year_word)
+        or ("предыдущ" in q and has_year_word)
+        or "истори" in q
+        or ("сравни" in q and has_year_word)
+        or "какие года" in q or "какие годы" in q
+        or "доступные год" in q
+    ):
+        yt = year_trend(combined_df)
+        if yt.empty:
+            return "В этом файле нет годовых колонок (план/факт/прогноз) для сравнения по годам."
+        lines = [f"{r.Год} — {r.Тип}: {format_money(r.Сумма, unit)}" for r in yt.itertuples()]
+        return "Годы, представленные в файле:\n" + "\n".join(lines)
 
     tokens = [t for t in re.split(r"[^а-яa-zё0-9]+", q) if len(t) > 3]
     if tokens:
