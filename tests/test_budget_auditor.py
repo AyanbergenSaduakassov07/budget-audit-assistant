@@ -25,6 +25,7 @@ from core.budget_auditor.analysis import (
     workbook_summary_text,
     year_trend_text,
     chat_answer,
+    answer_query,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -194,22 +195,26 @@ def test_chat_answers_span_whole_file(full_form):
 
 # --- chat_answer year-availability branches -------------------------------------
 def _no_target_year_workbook(path):
-    """Subsidiary B-style single sheet: campaign year 2027, only a plan_2027 column —
-    no 2025/2026 data at all, so a question about 2026 has no column to hit."""
+    """Subsidiary B-style single sheet: campaign year 2027, plan_2027 AND fact_2025 —
+    but no 2025 PLAN and no 2026 data of any kind, so a question about 2026 has
+    no column to hit while 2025 only has факт (no план/прогноз) -- the exact
+    shape that used to trigger the plan_/forecast_-only bug on year_col."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "OPEX"
     _write_meta(ws, campaign_year=2027)
     hdr = 9
-    _write_headers(ws, hdr, {9: "Контрагент", 11: "План за 2027 год"})
+    _write_headers(ws, hdr, {
+        9: "Контрагент", 11: "План за 2027 год", 12: "2025 год факт",
+    })
     r = hdr + 1
     ws.cell(row=r, column=3, value="IT-OP-01"); ws.cell(row=r, column=4, value="Оборудование")
     r += 1  # Subsidiary B style: item name at category level, no subcategory
     ws.cell(row=r, column=7, value="Серверы"); ws.cell(row=r, column=9, value="Dell")
-    ws.cell(row=r, column=11, value=9000)
+    ws.cell(row=r, column=11, value=9000); ws.cell(row=r, column=12, value=8500)
     r += 1
     ws.cell(row=r, column=7, value="СХД"); ws.cell(row=r, column=9, value="HP")
-    ws.cell(row=r, column=11, value=800)
+    ws.cell(row=r, column=11, value=800); ws.cell(row=r, column=12, value=750)
     ws.cell(row=r + 1, column=3, value="Итого"); ws.cell(row=r + 1, column=11, value=9800)
     wb.save(path)
     return path
@@ -230,6 +235,55 @@ def test_chat_answer_lists_available_years_for_history_question(tmp_path):
     assert reply is not None
     assert "2027" in reply
     assert "план" in reply.lower()  # sourced from year_trend()
+
+
+# --- year_col priority: plan_ > fact_ > forecast_ (regression) ------------------
+# A year with ONLY факт data (no план/прогноз) is very common -- prior-year
+# actuals with no committed plan for that year. Before this fix, year_col only
+# ever checked plan_/forecast_, so asking about such a year fell through to
+# "Данных за {year} год в этом файле нет" while the SAME reply then listed that
+# year as available in "Доступные годы" -- a self-contradiction (year_col was
+# None but available_years() correctly includes fact_ years).
+def test_chat_answer_resolves_fact_only_year(tmp_path):
+    meta, _, _, combined = _run_pipeline(_no_target_year_workbook(tmp_path / "subb3.xlsx"))
+    reply = chat_answer("сколько потратили в 2025 году", combined, meta)
+    assert reply is not None
+    assert "Данных за 2025 год в этом файле нет" not in reply  # no more self-contradiction
+    assert "Факт на 2025 год" in reply
+    assert "9 250" in reply  # 8500 + 750
+
+
+def test_answer_query_resolves_fact_only_year(tmp_path):
+    _, sheets = parse_workbook(_no_target_year_workbook(tmp_path / "subb4.xlsx"))
+    df, stats = sheets["OPEX"]["df"], sheets["OPEX"]["stats"]
+    meta = {"unit": 1000}
+    reply = answer_query("что по 2025 году", df, stats, meta)
+    assert reply is not None
+    assert reply.startswith("Факт на 2025 год")
+    assert "9 250" in reply
+
+
+def test_year_col_priority_prefers_plan_over_fact(tmp_path):
+    """When a year has BOTH план and факт (e.g. 2026 in full_form), plan wins."""
+    from core.budget_auditor.analysis import _resolve_year_col
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OPEX"
+    _write_meta(ws, campaign_year=2026)
+    hdr = 9
+    _write_headers(ws, hdr, {9: "Контрагент", 10: "2026 год факт", 11: "План за 2026 год"})
+    r = hdr + 1
+    ws.cell(row=r, column=3, value="IT-OP-01"); ws.cell(row=r, column=4, value="Связь")
+    r += 1
+    ws.cell(row=r, column=7, value="Услуги связи"); ws.cell(row=r, column=8, value="Интернет")
+    ws.cell(row=r, column=10, value=3000); ws.cell(row=r, column=11, value=3300)
+    ws.cell(row=r + 1, column=3, value="Итого"); ws.cell(row=r + 1, column=11, value=3300)
+    path = tmp_path / "both.xlsx"
+    wb.save(path)
+    _, sheets = parse_workbook(path)
+    df = sheets["OPEX"]["df"]
+    assert _resolve_year_col(df, 2026) == "plan_2026"
 
 
 # --- dual plan-year columns (campaign year must win, not column order) ----------

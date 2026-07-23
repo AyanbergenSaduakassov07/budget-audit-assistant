@@ -133,6 +133,24 @@ def year_trend_text(combined_df):
 
 _MONTHS = {}  # placeholder for future NL date parsing
 
+# Priority order for resolving "what happened in year X": prefer the
+# committed plan if the form has one, otherwise the actual (факт), otherwise
+# a forward-looking forecast -- matching how a human would read the question.
+_YEAR_VALUE_PREFIXES = ("plan", "fact", "forecast")
+_YEAR_VALUE_LABELS = {"plan": "План", "fact": "Факт", "forecast": "Прогноз"}
+
+
+def _resolve_year_col(df, year):
+    """First existing <prefix>_<year> column in priority order plan > fact >
+    forecast, or None if the year isn't represented by any of the three."""
+    if not year:
+        return None
+    for prefix in _YEAR_VALUE_PREFIXES:
+        col = f"{prefix}_{year}"
+        if col in df.columns:
+            return col
+    return None
+
 
 def answer_query(question, df, stats, meta):
     """Deterministic keyword/year/regex based Q&A over one parsed sheet.
@@ -170,13 +188,11 @@ def answer_query(question, df, stats, meta):
     if any(w in q for w in ["сколько статей", "количество статей", "число статей"]):
         return f"Заполненных статей расхода: {len(df)}."
 
-    if year and (f"plan_{year}" in df.columns):
-        total = pd.to_numeric(df[f"plan_{year}"], errors="coerce").sum()
-        return f"План на {year} год: {format_money(total, unit)}."
-
-    if year and (f"forecast_{year}" in df.columns):
-        total = pd.to_numeric(df[f"forecast_{year}"], errors="coerce").sum()
-        return f"Прогноз на {year} год: {format_money(total, unit)}."
+    year_col = _resolve_year_col(df, year)
+    if year_col:
+        total = pd.to_numeric(df[year_col], errors="coerce").sum()
+        label = _YEAR_VALUE_LABELS[year_col.split("_", 1)[0]]
+        return f"{label} на {year} год: {format_money(total, unit)}."
 
     # keyword search across item_name / category / subcategory / counterparty
     tokens = [t for t in re.split(r"[^а-яa-zё0-9]+", q) if len(t) > 3]
@@ -226,9 +242,7 @@ def chat_answer(question, combined_df, meta):
 
     year_match = re.search(r"(20\d{2})", q)
     year = int(year_match.group(1)) if year_match else None
-    year_col = f"plan_{year}" if year and f"plan_{year}" in combined_df.columns else (
-        f"forecast_{year}" if year and f"forecast_{year}" in combined_df.columns else None
-    )
+    year_col = _resolve_year_col(combined_df, year)
 
     wants_capex = "capex" in q or "капекс" in q or "капвлож" in q
     wants_opex = "opex" in q or "опекс" in q or "операционн" in q
@@ -278,7 +292,7 @@ def chat_answer(question, combined_df, meta):
 
     if year and year_col:
         total = pd.to_numeric(combined_df[year_col], errors="coerce").sum()
-        label = "План" if year_col.startswith("plan_") else "Прогноз"
+        label = _YEAR_VALUE_LABELS[year_col.split("_", 1)[0]]
         return f"{label} на {year} год (OPEX+CAPEX, все подразделения): {format_money(total, unit)}."
 
     if any(w in q for w in ["сколько статей", "количество статей"]):
