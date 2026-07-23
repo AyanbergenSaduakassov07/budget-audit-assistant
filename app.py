@@ -43,6 +43,7 @@ from core.budget_auditor.parser import (
     _best_baseline_col,
 )
 from core.budget_auditor.analysis import workbook_summary_text, year_trend_text, chat_answer
+from core.budget_auditor.narrator_bridge import narrative_opening
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +330,15 @@ def _current_threshold() -> float:
     return float(st.session_state.get("yoy_threshold", DEFAULT_THRESHOLD))
 
 
+@st.cache_data(show_spinner="Формирую заключение…")
+def _cached_opening(file_bytes: bytes, threshold: float) -> str | None:
+    """Gemini executive summary for the analysis opening, cached per
+    (file, threshold) so history re-renders never repeat the API call.
+    None (no key / any failure) means: use the template summary."""
+    a = _analyze(file_bytes, threshold)
+    return narrative_opening(a["meta"], a["combined"])
+
+
 def render_capex_opex(a: dict) -> None:
     st.markdown(f"**CAPEX vs OPEX — {a['plan_year'] if a['plan_year'] else 'год кампании'}**")
     cvo = capex_opex_table(a["combined"])
@@ -455,7 +465,10 @@ def render_analysis(entry: dict) -> None:
             "Проверьте, что это действительно форма ИТ-расходов компании."
         )
         return
-    st.write(workbook_summary_text(a["meta"], a["flagged_sheets"]))
+    # Opening text: Gemini executive summary when GEMINI_API_KEY is set and the
+    # call succeeds; otherwise the template summary — silently, never an error.
+    opening = _cached_opening(entry["bytes"], _current_threshold())
+    st.write(opening or workbook_summary_text(a["meta"], a["flagged_sheets"]))
     if a["empty_sheets"]:
         st.caption(
             "Пустые/незаполненные листы (только шаблон, без данных): "
