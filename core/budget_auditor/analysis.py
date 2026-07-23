@@ -296,12 +296,14 @@ def chat_answer(question, combined_df, meta):
     # General "what years / prior years are in here" question with no specific
     # year mentioned — answer from year_trend() (same source as the
     # «Динамика по годам» chart), listing every факт/план/прогноз year present.
+    # A comparison request ("сравни их") is deliberately NOT caught here: it
+    # needs real aggregation, so it falls through to the SQL fallback in app.py.
     has_year_word = "год" in q or "лет" in q
-    if year is None and (
+    wants_comparison = "сравн" in q
+    if year is None and not wants_comparison and (
         ("прошл" in q and has_year_word)
         or ("предыдущ" in q and has_year_word)
         or "истори" in q
-        or ("сравни" in q and has_year_word)
         or "какие года" in q or "какие годы" in q
         or "доступные год" in q
     ):

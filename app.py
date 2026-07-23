@@ -45,6 +45,7 @@ from core.budget_auditor.parser import (
 )
 from core.budget_auditor.analysis import workbook_summary_text, year_trend_text, chat_answer
 from core.budget_auditor.narrator_bridge import build_audit_result, narrative_opening
+from core.budget_auditor.file_sql import answer_over_file
 from core.conclusion_generator import generate_conclusion
 
 logger = logging.getLogger(__name__)
@@ -529,7 +530,12 @@ def answer_question(question: str) -> str:
         logger.exception("workbook parse failed during chat")
         return f"Не удалось разобрать файл «{active['name']}» — загрузите его заново."
     reply = chat_answer(question, a["combined"], a["meta"])
-    return reply if reply is not None else FALLBACK_REPLY
+    if reply is not None:
+        return reply
+    # Rule-based path found nothing: try Gemini text-to-SQL over this file's
+    # data. Returns None (silently) if no key / quota / failure -> not-found msg.
+    sql_reply = answer_over_file(question, a["combined"], a["meta"])
+    return sql_reply if sql_reply is not None else FALLBACK_REPLY
 
 
 # --- page ----------------------------------------------------------------------
