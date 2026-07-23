@@ -373,6 +373,43 @@ def _best_baseline_col(df, plan_year):
     return None
 
 
+def _flag_quarterly(df, plan_year, plan_col):
+    """Quarterly reconciliation, mirroring budget_audit.quarterly_reconciliation
+    but on the dynamic per-year names (plan_<year>_q1..q4 vs plan_<year>):
+    |annual - Σquarters| / annual over 1% flags the row; over 5% = "critical",
+    otherwise "minor". Rows missing the annual value or any quarter, and rows
+    with a non-positive annual plan, are skipped — never flagged. Sheets whose
+    form has no quarterly breakdown at all keep every flag False (a structural
+    gap, same treatment as a missing prior-year baseline)."""
+    df["quarterly_sum"] = pd.NA
+    df["quarterly_gap_abs"] = pd.NA
+    df["quarterly_gap_pct"] = pd.NA
+    df["quarterly_severity"] = pd.NA
+    df["quarterly_mismatch_flag"] = False
+
+    quarter_cols = [f"plan_{plan_year}_q{n}" for n in range(1, 5)] if plan_year else []
+    if not quarter_cols or plan_col not in df.columns \
+            or not all(c in df.columns for c in quarter_cols):
+        return df
+
+    annual = pd.to_numeric(df[plan_col], errors="coerce")
+    quarters = df[quarter_cols].apply(pd.to_numeric, errors="coerce")
+    complete = annual.notna() & quarters.notna().all(axis=1) & (annual > 0)
+    qsum = quarters.sum(axis=1)
+    gap = annual - qsum
+    gap_pct = gap.abs() / annual * 100
+
+    df.loc[complete, "quarterly_sum"] = qsum[complete]
+    df.loc[complete, "quarterly_gap_abs"] = gap[complete]
+    df.loc[complete, "quarterly_gap_pct"] = gap_pct[complete]
+    flagged = complete & (gap_pct > 1.0)
+    df.loc[flagged, "quarterly_severity"] = gap_pct[flagged].map(
+        lambda pct: "critical" if pct > 5 else "minor"
+    )
+    df["quarterly_mismatch_flag"] = flagged
+    return df
+
+
 def flag_rows(df, stats, threshold_pct=15.0):
     """Return df with added risk/quality flag columns. Works even when
     prior-year columns don't exist in this subsidiary's form."""
@@ -409,4 +446,4 @@ def flag_rows(df, stats, threshold_pct=15.0):
     else:
         df["high_price_flag"] = False
 
-    return df
+    return _flag_quarterly(df, plan_year, plan_col)

@@ -72,6 +72,21 @@ FLAG_VIEW_LABELS = {
     "justification": "Обоснование",
 }
 
+# The quarterly-mismatch table shows reconciliation evidence instead of the
+# YoY delta/justification columns.
+QUARTER_VIEW_LABELS = {
+    "branch": "Подразделение",
+    "cost_type": "Тип",
+    "statya_code": "Статья",
+    "item_name": "Позиция",
+    "counterparty": "Контрагент",
+    "quarterly_sum": "Σ кварталов",
+    "quarterly_gap_abs": "Разница",
+    "quarterly_gap_pct": "Разница %",
+    "quarterly_severity": "Серьёзность",
+}
+SEVERITY_RU = {"critical": "критично", "minor": "незначительно"}
+
 MONEY_FMT = "{:,.0f}"
 
 NO_FILE_REPLY = (
@@ -248,6 +263,32 @@ def _format_eager(disp: pd.DataFrame, fmt: dict) -> pd.DataFrame:
     return out
 
 
+def _severity(value) -> str:
+    if value is None or pd.isna(value):
+        return "н/д"
+    return SEVERITY_RU.get(value, str(value))
+
+
+def build_quarterly_view(subset: pd.DataFrame, plan_col: str | None) -> tuple[pd.DataFrame, dict]:
+    """Same shape as build_flag_view, for the quarterly-reconciliation table:
+    display columns, Russian headers, and the format map."""
+    labels = dict(QUARTER_VIEW_LABELS)
+    if plan_col:
+        labels[plan_col] = f"План {plan_col.removeprefix('plan_')}"
+    show = [c for c in
+            ["branch", "cost_type", "statya_code", "item_name", "counterparty",
+             plan_col, "quarterly_sum", "quarterly_gap_abs", "quarterly_gap_pct",
+             "quarterly_severity"]
+            if c and c in subset.columns]
+    disp = subset[show].rename(columns=labels).reset_index(drop=True)
+    fmt = {}
+    if plan_col and labels[plan_col] in disp.columns:
+        fmt[labels[plan_col]] = _money
+    fmt.update({"Σ кварталов": _money, "Разница": _money,
+                "Разница %": _share, "Серьёзность": _severity})
+    return disp, fmt
+
+
 def render_flag_view(subset: pd.DataFrame, plan_col: str | None) -> None:
     disp, fmt = build_flag_view(subset, plan_col)
     out = _format_eager(disp, fmt)
@@ -373,6 +414,31 @@ def render_flags(a: dict, threshold: float) -> None:
     else:
         with st.expander(f"Топ-10% по стоимости — {len(d)} (внутри своего листа)"):
             render_flag_view(d, a["plan_col"])
+
+    d = subset("quarterly_mismatch_flag")
+    no_quarters = [sn for sn, dd in flagged.items()
+                   if not any(c.startswith("plan_") and "_q" in c for c in dd["df"].columns)]
+    if d.empty:
+        if len(no_quarters) == len(flagged):
+            st.caption("Квартальная разбивка в форме отсутствует — сверка кварталов невозможна.")
+        else:
+            st.caption("✓ Квартальные суммы согласуются с годовым планом (допуск 1%).")
+            if no_quarters:
+                st.caption("Листы без квартальной разбивки: " + ", ".join(no_quarters))
+    else:
+        n_critical = int((d["quarterly_severity"] == "critical").sum())
+        label = f"Несоответствие по кварталам — {len(d)}"
+        if n_critical:
+            label += f" (критичных: {n_critical})"
+        with st.expander(label):
+            st.caption("Сумма кварталов расходится с годовым планом более чем на 1%; "
+                       "свыше 5% — критично.")
+            if no_quarters:
+                st.caption("Листы без квартальной разбивки (не проверялись): "
+                           + ", ".join(no_quarters))
+            disp, fmt = build_quarterly_view(d, a["plan_col"])
+            out = _format_eager(disp, fmt)
+            st.dataframe(out.where(out.notna(), "—"), use_container_width=True, hide_index=True)
 
 
 def render_analysis(entry: dict) -> None:

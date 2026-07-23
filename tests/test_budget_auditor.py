@@ -300,3 +300,92 @@ def test_year_trend_flags_unit_mismatch():
     assert yt.loc[yt["Год"] == 2025, "unit_mismatch_suspected"].all()
     assert not yt.loc[yt["Год"] != 2025, "unit_mismatch_suspected"].any()
     assert "единиц измерения" in year_trend_text(fake)
+
+
+# --- quarterly reconciliation flag ----------------------------------------------
+# Mirrors test_budget_audit.py's quarterly_reconciliation tests on the
+# budget_auditor schema: dynamic plan_<year>_qN columns, campaign year 2026.
+def _quarterly_workbook(path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OPEX"
+    _write_meta(ws)  # campaign year 2026
+    hdr = 9
+    _write_headers(ws, hdr, {
+        9: "Контрагент", 10: "Обоснование", 11: "План за 2026 год",
+        12: "1 кв 2026", 13: "2 кв 2026", 14: "3 кв 2026", 15: "4 кв 2026",
+    })
+    rows = [
+        # (item, annual, q1, q2, q3, q4)
+        ("Точно", 100_000, 25_000, 25_000, 25_000, 25_000),          # exact -> clean
+        ("Критично", 100_000, 23_500, 23_500, 23_500, 23_500),       # 6% off -> critical
+        ("Незначительно", 100_000, 24_500, 24_500, 24_500, 24_500),  # 2% off -> minor
+        ("Без кварталов", 50_000, None, None, None, None),           # incomplete -> skipped
+    ]
+    r = hdr + 1
+    ws.cell(row=r, column=3, value="IT-OP-01")
+    ws.cell(row=r, column=4, value="Услуги")
+    for item, annual, *quarters in rows:
+        r += 1
+        ws.cell(row=r, column=7, value="Услуги")
+        ws.cell(row=r, column=8, value=item)
+        ws.cell(row=r, column=9, value="Вендор")
+        ws.cell(row=r, column=10, value="обоснование есть")
+        ws.cell(row=r, column=11, value=annual)
+        for i, q in enumerate(quarters):
+            if q is not None:
+                ws.cell(row=r, column=12 + i, value=q)
+    ws.cell(row=r + 1, column=3, value="Итого")
+    ws.cell(row=r + 1, column=11, value=350_000)
+    wb.save(path)
+    return path
+
+
+@pytest.fixture
+def quarterly_combined(tmp_path):
+    _, _, _, combined = _run_pipeline(_quarterly_workbook(tmp_path / "quarters.xlsx"))
+    return combined
+
+
+def test_quarterly_mismatch_flags_only_offending_rows(quarterly_combined):
+    flagged = quarterly_combined[quarterly_combined["quarterly_mismatch_flag"]]
+    assert set(flagged["item_name"]) == {"Критично", "Незначительно"}
+
+    crit = flagged[flagged["item_name"] == "Критично"].iloc[0]
+    assert crit["quarterly_sum"] == 94_000
+    assert crit["quarterly_gap_abs"] == 6_000
+    assert crit["quarterly_gap_pct"] == pytest.approx(6.0)
+    assert crit["quarterly_severity"] == "critical"
+
+    minor = flagged[flagged["item_name"] == "Незначительно"].iloc[0]
+    assert minor["quarterly_gap_pct"] == pytest.approx(2.0)
+    assert minor["quarterly_severity"] == "minor"
+
+
+def test_quarterly_mismatch_ignores_exact_and_incomplete(quarterly_combined):
+    exact = quarterly_combined[quarterly_combined["item_name"] == "Точно"].iloc[0]
+    assert not exact["quarterly_mismatch_flag"]
+    assert exact["quarterly_gap_pct"] == pytest.approx(0.0)
+
+    skipped = quarterly_combined[quarterly_combined["item_name"] == "Без кварталов"].iloc[0]
+    assert not skipped["quarterly_mismatch_flag"]
+    assert pd.isna(skipped["quarterly_gap_pct"])
+    assert pd.isna(skipped["quarterly_severity"])
+
+
+def test_quarterly_flag_absent_columns_never_flags(full_form):
+    # The full-form fixture has no quarterly columns at all: the flag columns
+    # must still exist (all False / NA) so the UI never KeyErrors on them.
+    _, _, _, combined = full_form
+    assert "quarterly_mismatch_flag" in combined.columns
+    assert not combined["quarterly_mismatch_flag"].any()
+    assert combined["quarterly_gap_pct"].isna().all()
+
+
+def test_quarterly_view_renders_severity_in_russian(quarterly_combined, app_helpers):
+    subset = quarterly_combined[quarterly_combined["quarterly_mismatch_flag"]]
+    disp, fmt = app_helpers["build_quarterly_view"](subset, "plan_2026")
+    out = app_helpers["_format_eager"](disp, fmt)
+    assert "критично" in out["Серьёзность"].tolist()
+    assert "незначительно" in out["Серьёзность"].tolist()
+    assert "94 000" in out["Σ кварталов"].tolist()
