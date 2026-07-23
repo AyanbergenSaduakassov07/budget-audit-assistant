@@ -1,16 +1,30 @@
-"""ACM IT Budget Auditor — single-page Streamlit app.
+"""ACM IT Budget Auditor — single-page, chat-first Streamlit app.
 
-This is the ONLY file allowed to import streamlit (SPEC.md architecture rule).
+The conversation IS the app (ChatGPT-style): one st.chat_input with
+accept_file=True is the only input on the page. Dropping a ИТ-бюджет .xlsx into it
+runs the existing parse -> flag_rows -> aggregate_workbook pipeline and pushes
+the full analysis as ONE assistant message (summary text, CAPEX/OPEX table +
+chart, year trend, three collapsed flag expanders). Every follow-up question
+goes through the same box and is answered by core chat_answer() over the whole
+file.
+
+Streamlit imports live only in app.py (SPEC.md architecture rule).
 All parsing/analysis math lives in core.budget_auditor.{parser,analysis};
 app.py only reshapes, renames, formats, and renders what that layer returns.
 
-Page flow (fixed order):
-  1. One .xlsx uploader (форма ИТ-расходов ИТ-бюджет).
-  2. Auto-generated text description of the whole workbook.
-  3. CAPEX vs OPEX comparison table + bar chart for the campaign year.
-  4. Three flagged-статьи views: резкое изменение г/г (порог — слайдер),
-     без обоснования, топ-10% по стоимости.
-  5. Chat over the ENTIRE file (all sheets, branches, OPEX+CAPEX).
+Layout: centered ~820px column, quiet single-line title top-left, bordered
+chat bubbles on a warm near-white surface, navy #1F3A5F as accent only.
+The YoY threshold slider lives in a "⚙️ Настройки" popover pinned near the
+chat input.
+
+State model (st.session_state):
+  file_chat_history — ordered list of messages. Text entries keep the original
+      {"role", "content"} shape; a file drop appends an assistant entry with
+      kind="analysis" carrying the workbook bytes, re-rendered on every rerun
+      through the cached parser.
+  active_file — {"name", "bytes"} of the most recent upload; chat_answer()
+      always runs against it.
+  yoy_threshold — slider value; flags recompute live on change.
 """
 
 import logging
@@ -32,9 +46,13 @@ from core.budget_auditor.analysis import workbook_summary_text, year_trend_text,
 
 logger = logging.getLogger(__name__)
 
-# --- palette (SPEC design system) --------------------------------------------
+# --- palette (SPEC design system — navy is an accent, never a background fill)
 NAVY = "#1F3A5F"
-BG = "#F6F4EF"
+SURFACE = "#FAF9F6"
+BUBBLE = "#FFFFFF"
+BORDER = "#E3E0D8"
+INK = "#2C2C2A"
+INK_MUTED = "#6B6960"
 # Fixed per-series colors for the year-trend chart (color follows the entity,
 # never the series count): план=navy, факт=green, прогноз=amber.
 TREND_COLORS = {"план": "#1F3A5F", "факт": "#2E7D32", "прогноз": "#F59E0B"}
@@ -56,23 +74,104 @@ FLAG_VIEW_LABELS = {
 
 MONEY_FMT = "{:,.0f}"
 
+NO_FILE_REPLY = (
+    "Сначала загрузите файл формы ИТ-расходов — прикрепите .xlsx "
+    "через скрепку в поле ввода."
+)
+FALLBACK_REPLY = (
+    "Не нашёл точного ответа на этот вопрос. Попробуйте указать год "
+    "(например, «план на 2026») или ключевое слово статьи расхода."
+)
+
 
 # --- rendering helpers (presentation only, no math) ---------------------------
 def inject_css() -> None:
     st.markdown(
-        """
+        f"""
         <style>
-        .stApp { background-color: #F6F4EF; }
-        h1, h2, h3, h4, h5, h6 { color: #1F3A5F !important; }
-        p, label, span, div { color: #2C2C2A; }
-        .stMetric label { color: #5F5E5A !important; font-size: 13px; }
-        .stMetric [data-testid="stMetricValue"] { color: #1F3A5F !important; font-size: 22px; font-weight: 700; }
-        .stCaption { color: #5F5E5A !important; }
-        section[data-testid="stSidebar"] { background-color: #FFFFFF; }
-        [data-testid="stDataFrame"] { background-color: #FFFFFF; border-radius: 6px; }
-        .app-header { background: #1F3A5F; padding: 24px 28px; border-radius: 10px; margin-bottom: 20px; }
-        .app-header-title { color: #FFFFFF !important; margin: 0; font-size: 22px; font-weight: 700; }
-        .app-header-sub { color: #D5D2CC !important; margin: 6px 0 0; font-size: 14px; }
+        /* Centered reading column, 8px spacing rhythm */
+        [data-testid="stMainBlockContainer"], .main .block-container {{
+            max-width: 820px; margin: 0 auto; padding: 64px 24px 8px;
+        }}
+        [data-testid="stBottomBlockContainer"], [data-testid="stBottom"] > div {{
+            max-width: 820px; margin: 0 auto;
+        }}
+        .stApp, [data-testid="stBottom"] {{ background: {SURFACE}; }}
+        [data-testid="stHeader"] {{ background: transparent; }}
+
+        /* Type: 16px body, 1.5 line-height, ink on warm white */
+        .stMarkdown p, .stMarkdown li, .stChatMessage p {{
+            font-size: 16px; line-height: 1.5; color: {INK};
+        }}
+        h1, h2, h3, h4, h5, h6 {{ color: {NAVY} !important; }}
+        .stCaption, [data-testid="stCaptionContainer"] p {{ color: {INK_MUTED} !important; }}
+        a {{ color: {NAVY}; }}
+
+        .app-title {{
+            font-size: 15px; font-weight: 600; color: {NAVY};
+            margin: 0 0 16px; letter-spacing: .01em;
+        }}
+
+        /* Chat bubbles: subtle border, no heavy fill */
+        [data-testid="stChatMessage"] {{
+            background: {BUBBLE}; border: 1px solid {BORDER};
+            border-radius: 12px; padding: 16px; margin-bottom: 8px;
+        }}
+
+        /* Chat input: quiet border, navy only on focus */
+        [data-testid="stChatInput"] {{
+            background: {BUBBLE}; border: 1px solid {BORDER}; border-radius: 12px;
+        }}
+        [data-testid="stChatInput"]:focus-within {{
+            border-color: {NAVY}; box-shadow: 0 0 0 1px {NAVY}33;
+        }}
+
+        /* Buttons: navy accent (outline -> filled on hover), 150ms */
+        .stButton > button, [data-testid="stPopover"] button {{
+            color: {NAVY}; background: {BUBBLE}; border: 1px solid {NAVY};
+            border-radius: 8px; min-height: 40px; transition: background 150ms ease-out;
+        }}
+        .stButton > button:hover, [data-testid="stPopover"] button:hover {{
+            background: {NAVY}; color: #FFFFFF; border-color: {NAVY};
+        }}
+        @media (prefers-reduced-motion: reduce) {{
+            .stButton > button, [data-testid="stPopover"] button {{ transition: none; }}
+        }}
+
+        /* Settings popover pinned near the chat input (bottom-right of column).
+           z-index must beat stBottom's layer or the trigger is unclickable;
+           width must collapse to content or it stretches into a full-width bar. */
+        [data-testid="stPopover"] {{
+            position: fixed; bottom: 96px; z-index: 1000;
+            right: max(24px, calc((100vw - 868px) / 2));
+            left: auto; width: auto;
+        }}
+        [data-testid="stPopover"] > button {{ width: auto; }}
+
+        /* Avatars: assistant in accent navy, user in neutral ink — never the
+           loud red/orange defaults (they'd be the strongest color on the page) */
+        [data-testid="chatAvatarIcon-assistant"],
+        [data-testid="stChatMessageAvatarAssistant"] {{
+            background-color: {NAVY} !important; color: #FFFFFF !important;
+        }}
+        [data-testid="chatAvatarIcon-user"],
+        [data-testid="stChatMessageAvatarUser"] {{
+            background-color: {INK_MUTED} !important; color: #FFFFFF !important;
+        }}
+
+        [data-testid="stExpander"] {{
+            background: {BUBBLE}; border: 1px solid {BORDER}; border-radius: 8px;
+        }}
+        [data-testid="stDataFrame"] {{ background: {BUBBLE}; border-radius: 6px; }}
+
+        /* Empty state: vertically centered short prompt */
+        .empty-state {{
+            min-height: 55vh; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; text-align: center; gap: 8px;
+        }}
+        .empty-state .es-title {{ font-size: 20px; font-weight: 600; color: {NAVY}; margin: 0; }}
+        .empty-state .es-sub {{ font-size: 15px; color: {INK_MUTED}; max-width: 60ch; margin: 0; line-height: 1.5; }}
+        .empty-state .es-hint {{ font-size: 13px; color: {INK_MUTED}; margin-top: 16px; }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -138,84 +237,63 @@ def build_flag_view(subset: pd.DataFrame, plan_col: str | None) -> tuple[pd.Data
     return disp, fmt
 
 
-def render_flag_view(subset: pd.DataFrame, plan_col: str | None, empty_msg: str) -> None:
-    if subset.empty:
-        st.success(empty_msg)
-        return
+def _format_eager(disp: pd.DataFrame, fmt: dict) -> pd.DataFrame:
+    """Apply formatters as values, not via Styler: st.dataframe draws null cells
+    as gray 'None' regardless of Styler display text, so NA must become 'н/д'
+    before the frame reaches the grid."""
+    out = disp.copy()
+    for col, formatter in fmt.items():
+        if col in out.columns:
+            out[col] = out[col].map(formatter)
+    return out
+
+
+def render_flag_view(subset: pd.DataFrame, plan_col: str | None) -> None:
     disp, fmt = build_flag_view(subset, plan_col)
-    st.dataframe(disp.style.format(fmt), use_container_width=True, hide_index=True)
+    out = _format_eager(disp, fmt)
+    # Unformatted object columns (Обоснование, Контрагент) can hold raw None —
+    # show an em dash instead of the grid's gray "None".
+    st.dataframe(out.where(out.notna(), "—"), use_container_width=True, hide_index=True)
 
 
-# --- page ----------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Аудит IT-бюджетов компании", page_icon=None)
-inject_css()
+def _analyze(file_bytes: bytes, threshold: float) -> dict:
+    """Existing pipeline, unchanged: parse -> flag_rows -> aggregate_workbook.
 
-st.markdown(
-    '<div class="app-header">'
-    '<div class="app-header-title">Аудит IT-бюджетов компании</div>'
-    '<p class="app-header-sub">Загрузите один файл формы ИТ-расходов — система '
-    'разберёт его целиком, опишет текстом, сравнит CAPEX/OPEX, найдёт проблемные '
-    'статьи и ответит на вопросы по всему файлу</p></div>',
-    unsafe_allow_html=True,
-)
-
-# ---------- 1. Single file uploader ----------
-uploaded = st.file_uploader("Excel-файл формы ИТ-расходов (.xlsx)", type=["xlsx"])
-if uploaded is None:
-    st.info("Загрузите файл, чтобы начать анализ.")
-    st.stop()
-
-try:
-    meta, sheets = _cached_parse(uploaded.getvalue())
-except Exception as e:
-    logger.exception("workbook parse failed")
-    st.error(f"Не удалось разобрать файл: {e}")
-    st.stop()
-
-usable_sheets = {sn: d for sn, d in sheets.items() if d["df"] is not None and not d["df"].empty}
-empty_sheets = [sn for sn in sheets if sn not in usable_sheets]
-
-if not usable_sheets:
-    st.warning(
-        "Ни в одном листе не найдено заполненных статей расхода. "
-        "Проверьте, что это действительно форма ИТ-расходов компании."
+    Returns everything a render pass or chat_answer() needs. Raises whatever
+    parse_workbook raises on an unreadable file.
+    """
+    meta, sheets = _cached_parse(file_bytes)
+    usable = {sn: d for sn, d in sheets.items() if d["df"] is not None and not d["df"].empty}
+    flagged = {
+        sn: {"df": flag_rows(d["df"], d["stats"], threshold_pct=threshold), "stats": d["stats"]}
+        for sn, d in usable.items()
+    }
+    combined = aggregate_workbook(flagged)
+    plan_year = (
+        combined["plan_year"].dropna().iloc[0]
+        if not combined.empty and combined["plan_year"].notna().any()
+        else None
     )
-    st.stop()
+    return {
+        "meta": meta,
+        "flagged_sheets": flagged,
+        "combined": combined,
+        "empty_sheets": [sn for sn in sheets if sn not in usable],
+        "plan_year": plan_year,
+        "plan_col": f"plan_{plan_year}" if plan_year else None,
+    }
 
-# The threshold slider is rendered in section 4, but the flag columns it controls
-# feed the description in section 2. Streamlit reruns top-to-bottom with widget
-# state already updated in session_state, so reading it here is consistent on
-# every rerun; the first run simply uses the slider's default.
-threshold = float(st.session_state.get("yoy_threshold", DEFAULT_THRESHOLD))
 
-flagged_sheets = {
-    sn: {"df": flag_rows(d["df"], d["stats"], threshold_pct=threshold), "stats": d["stats"]}
-    for sn, d in usable_sheets.items()
-}
-combined = aggregate_workbook(flagged_sheets)
+def _current_threshold() -> float:
+    return float(st.session_state.get("yoy_threshold", DEFAULT_THRESHOLD))
 
-plan_year = (
-    combined["plan_year"].dropna().iloc[0]
-    if not combined.empty and combined["plan_year"].notna().any()
-    else None
-)
-plan_col = f"plan_{plan_year}" if plan_year else None
 
-# ---------- 2. Auto-generated description ----------
-st.header("1. Описание файла")
-st.write(workbook_summary_text(meta, flagged_sheets))
-if empty_sheets:
-    st.warning(
-        "Пустые/незаполненные листы (только шаблон, без данных): "
-        + ", ".join(empty_sheets)
-    )
-
-# ---------- 3. CAPEX vs OPEX ----------
-st.header(f"2. CAPEX vs OPEX — {plan_year if plan_year else 'год кампании'}")
-cvo = capex_opex_table(combined)
-if cvo.empty:
-    st.info("Недостаточно данных для сравнения CAPEX/OPEX.")
-else:
+def render_capex_opex(a: dict) -> None:
+    st.markdown(f"**CAPEX vs OPEX — {a['plan_year'] if a['plan_year'] else 'год кампании'}**")
+    cvo = capex_opex_table(a["combined"])
+    if cvo.empty:
+        st.caption("Недостаточно данных для сравнения CAPEX/OPEX.")
+        return
     plan_label = next((c for c in cvo.columns if c.startswith("План ")), None)
     fmt = {}
     if plan_label:
@@ -226,115 +304,175 @@ else:
         fmt["База пред. года"] = _money
     if "Δ %" in cvo.columns:
         fmt["Δ %"] = _pct
-    col_table, col_chart = st.columns([1, 2])
-    with col_table:
-        st.dataframe(cvo.style.format(fmt), use_container_width=True, hide_index=True)
-        if "Δ %" not in cvo.columns:
-            st.caption(
-                "Δ год-к-году не показана: в форме нет колонок прошлого года "
-                "(структурный пробел формы, не ошибка загрузки)."
-            )
-    with col_chart:
-        if plan_label:
-            st.bar_chart(cvo.set_index("Тип")[plan_label], color=NAVY)
+    st.dataframe(_format_eager(cvo, fmt), use_container_width=True, hide_index=True)
+    if "Δ %" not in cvo.columns:
+        st.caption(
+            "Δ год-к-году не показана: в форме нет колонок прошлого года "
+            "(структурный пробел формы, не ошибка загрузки)."
+        )
+    if plan_label:
+        st.bar_chart(cvo.set_index("Тип")[plan_label], color=NAVY, height=180, horizontal=True)
 
-# ---------- 3b. Динамика по годам ----------
-st.header("2b. Динамика по годам")
-trend = year_trend(combined)
-if trend.empty:
-    st.info("Недостаточно годовых колонок для построения тренда.")
-else:
+
+def render_trend(a: dict) -> None:
+    trend = year_trend(a["combined"])
+    if trend.empty:
+        return
+    st.markdown("**Динамика по годам**")
     # str years so the axis doesn't render 2026 as "2,026"
     wide = (
         trend.assign(Год=trend["Год"].astype(str))
         .pivot_table(index="Год", columns="Тип", values="Сумма", aggfunc="sum")
     )
-    st.line_chart(wide, color=[TREND_COLORS.get(c, NAVY) for c in wide.columns])
-    trend_note = year_trend_text(combined)
+    st.line_chart(wide, color=[TREND_COLORS.get(c, NAVY) for c in wide.columns], height=240)
+    trend_note = year_trend_text(a["combined"])
     if trend["unit_mismatch_suspected"].any():
         st.warning(trend_note)
     else:
         st.caption(trend_note)
 
-# ---------- 4. Flagged статьи (workbook-wide) ----------
-st.header("3. Проблемные и рискованные статьи (по всему файлу)")
-st.slider(
-    "Порог резкого изменения год-к-году, %",
-    min_value=5, max_value=50, value=DEFAULT_THRESHOLD, step=1,
-    key="yoy_threshold",
-)
 
-no_prior_sheets = [
-    sn for sn, d in flagged_sheets.items()
-    if _best_baseline_col(d["df"], d["stats"].get("plan_year")) is None
-]
-no_just_sheets = [
-    sn for sn, d in flagged_sheets.items() if not d["stats"]["has_justification"]
-]
+def render_flags(a: dict, threshold: float) -> None:
+    """Three flag categories: collapsed expander when non-empty, ✓ line when clean."""
+    st.markdown("**Проблемные и рискованные статьи**")
+    combined, flagged = a["combined"], a["flagged_sheets"]
+    no_prior = [sn for sn, d in flagged.items()
+                if _best_baseline_col(d["df"], d["stats"].get("plan_year")) is None]
+    no_just = [sn for sn, d in flagged.items() if not d["stats"]["has_justification"]]
 
-tab_change, tab_just, tab_price = st.tabs(
-    ["Резкое изменение г/г", "Без обоснования", "Топ-10% по стоимости"]
-)
+    def subset(flag: str) -> pd.DataFrame:
+        return combined[combined[flag]] if flag in combined else pd.DataFrame()
 
-with tab_change:
-    d = combined[combined["high_change_flag"]] if "high_change_flag" in combined else pd.DataFrame()
-    st.write(f"{len(d)} статей с изменением более {threshold:.0f}% к прошлому году")
-    if no_prior_sheets:
-        st.caption(
-            "Листы без данных прошлого года (сравнение г/г структурно невозможно): "
-            + ", ".join(no_prior_sheets)
-        )
-    render_flag_view(d, plan_col, "Резких изменений год-к-году не найдено.")
+    d = subset("high_change_flag")
+    if d.empty:
+        st.caption(f"✓ Резких изменений год-к-году (порог {threshold:.0f}%) не найдено.")
+    else:
+        with st.expander(f"Резкое изменение г/г — {len(d)} (порог {threshold:.0f}%)"):
+            if no_prior:
+                st.caption("Листы без данных прошлого года (сравнение г/г структурно "
+                           "невозможно): " + ", ".join(no_prior))
+            render_flag_view(d, a["plan_col"])
+    if no_prior and d.empty:
+        st.caption("Листы без данных прошлого года: " + ", ".join(no_prior))
 
-with tab_just:
-    d = combined[combined["missing_justification_flag"]] if "missing_justification_flag" in combined else pd.DataFrame()
-    st.write(f"{len(d)} статей без обоснования по всему файлу")
-    if no_just_sheets:
+    d = subset("missing_justification_flag")
+    if d.empty:
+        st.caption("✓ Все статьи имеют заполненное обоснование.")
+    else:
+        with st.expander(f"Без обоснования — {len(d)}"):
+            if no_just:
+                st.warning(
+                    "В этих листах колонка «Обоснование» отсутствует целиком — все их "
+                    "статьи считаются необоснованными: " + ", ".join(no_just)
+                )
+            render_flag_view(d, a["plan_col"])
+
+    d = subset("high_price_flag")
+    if d.empty:
+        st.caption("✓ Ценовых выбросов не найдено.")
+    else:
+        with st.expander(f"Топ-10% по стоимости — {len(d)} (внутри своего листа)"):
+            render_flag_view(d, a["plan_col"])
+
+
+def render_analysis(entry: dict) -> None:
+    """The full file analysis as ONE assistant message body."""
+    try:
+        a = _analyze(entry["bytes"], _current_threshold())
+    except Exception as e:
+        logger.exception("workbook parse failed")
+        st.error(f"Не удалось разобрать файл «{entry['name']}»: {e}")
+        return
+    if not a["flagged_sheets"]:
         st.warning(
-            "В этих листах колонка «Обоснование» отсутствует целиком — все их статьи "
-            "считаются необоснованными: " + ", ".join(no_just_sheets)
+            "Ни в одном листе не найдено заполненных статей расхода. "
+            "Проверьте, что это действительно форма ИТ-расходов компании."
         )
-    render_flag_view(d, plan_col, "Все статьи имеют заполненное обоснование.")
+        return
+    st.write(workbook_summary_text(a["meta"], a["flagged_sheets"]))
+    if a["empty_sheets"]:
+        st.caption(
+            "Пустые/незаполненные листы (только шаблон, без данных): "
+            + ", ".join(a["empty_sheets"])
+        )
+    render_capex_opex(a)
+    render_trend(a)
+    render_flags(a, _current_threshold())
+    st.caption("Задайте вопрос по файлу — например, «сколько CAPEX в 2027» или "
+               "«какая ветка тратит больше».")
 
-with tab_price:
-    d = combined[combined["high_price_flag"]] if "high_price_flag" in combined else pd.DataFrame()
-    st.write(f"{len(d)} статей в верхних 10% по стоимости (внутри своего листа)")
-    render_flag_view(d, plan_col, "Ценовых выбросов не найдено.")
 
-# ---------- 5. Chat over the whole file ----------
-st.divider()
-st.header("4. Чат по этому файлу")
-st.caption(
-    "Вопросы по всему файлу сразу — все листы, подразделения (ГО/АФ/КазНИПИ), "
-    "OPEX и CAPEX: «сколько CAPEX в 2027», «сравни OPEX и CAPEX», "
-    "«какая ветка тратит больше», «топ самых дорогих статей»"
-)
+def answer_question(question: str) -> str:
+    """Route a chat question to core chat_answer() over the active file."""
+    active = st.session_state.get("active_file")
+    if active is None:
+        return NO_FILE_REPLY
+    try:
+        a = _analyze(active["bytes"], _current_threshold())
+    except Exception:
+        logger.exception("workbook parse failed during chat")
+        return f"Не удалось разобрать файл «{active['name']}» — загрузите его заново."
+    reply = chat_answer(question, a["combined"], a["meta"])
+    return reply if reply is not None else FALLBACK_REPLY
 
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
 
-if st.session_state["chat_history"] and st.button("Очистить чат"):
-    st.session_state["chat_history"] = []
-    st.rerun()
+# --- page ----------------------------------------------------------------------
+st.set_page_config(layout="wide", page_title="Аудит IT-бюджетов компании", page_icon=None)
+inject_css()
 
-for entry in st.session_state["chat_history"]:
+st.markdown('<p class="app-title">Аудит IT-бюджетов компании</p>', unsafe_allow_html=True)
+
+history = st.session_state.setdefault("file_chat_history", [])
+
+# Empty state: vertically centered prompt; the chat input below is the only form.
+if not history:
+    st.markdown(
+        '<div class="empty-state">'
+        '<p class="es-title">Загрузите форму ИТ-расходов</p>'
+        '<p class="es-sub">Один файл .xlsx — система опишет его текстом, сравнит '
+        'CAPEX и OPEX, покажет динамику по годам, найдёт рискованные статьи '
+        'и ответит на вопросы по всему файлу.</p>'
+        '<p class="es-hint">Прикрепите файл скрепкой в поле ввода ниже — '
+        'или сначала спросите, как это работает.</p>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+for entry in history:
     with st.chat_message(entry["role"]):
-        st.write(entry["content"])
+        if entry.get("kind") == "analysis":
+            render_analysis(entry)
+        else:
+            st.write(entry["content"])
 
-question = st.chat_input("Введите вопрос по файлу")
-if question:
-    st.session_state["chat_history"].append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.write(question)
-    reply = chat_answer(question, combined, meta)
-    if reply is None:
-        reply = (
-            "Не нашёл точного ответа на этот вопрос. Попробуйте указать год "
-            "(например, «план на 2026») или ключевое слово статьи расхода."
-        )
-    st.session_state["chat_history"].append({"role": "assistant", "content": reply})
-    with st.chat_message("assistant"):
-        st.write(reply)
+with st.popover("⚙️ Настройки"):
+    st.slider(
+        "Порог резкого изменения год-к-году, %",
+        min_value=5, max_value=50, value=DEFAULT_THRESHOLD, step=1,
+        key="yoy_threshold",
+    )
+    st.caption("Порог применяется ко всем показанным анализам сразу.")
+    if history and st.button("Очистить диалог"):
+        st.session_state["file_chat_history"] = []
+        st.session_state.pop("active_file", None)
+        st.rerun()
+    st.caption("Аудит IT-бюджетов · MVP v4.0")
 
-st.divider()
-st.caption("Аудит IT-бюджетов · MVP v3.0")
+submitted = st.chat_input(
+    "Загрузите файл или задайте вопрос",
+    accept_file=True,
+    file_type=["xlsx"],
+)
+if submitted:
+    files = submitted.files or []
+    text = (submitted.text or "").strip()
+    if files:
+        f = files[0]
+        st.session_state["active_file"] = {"name": f.name, "bytes": f.getvalue()}
+        history.append({"role": "user", "content": f"📎 {f.name}"})
+        history.append({"role": "assistant", "kind": "analysis",
+                        "name": f.name, "bytes": f.getvalue()})
+    if text:
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": answer_question(text)})
+    st.rerun()

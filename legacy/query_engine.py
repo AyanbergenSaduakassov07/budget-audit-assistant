@@ -18,7 +18,7 @@ import time
 from google import genai
 from google.genai import errors as genai_errors
 
-from core import warehouse
+from legacy import warehouse
 
 _MODEL = "gemini-flash-lite-latest"
 
@@ -215,7 +215,7 @@ def answer(question: str, db_path: str = "procurement.db") -> dict:
 
 
 if __name__ == "__main__":
-    from core.synth import generate_group
+    from legacy.synth import generate_group
 
     df, _ = generate_group()
     db_path = warehouse.build_warehouse(df)

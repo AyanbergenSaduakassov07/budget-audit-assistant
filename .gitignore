@@ -10,6 +10,7 @@ build/
 
 # Data
 *.db
+*.db-journal
 *.sqlite3
 
 # Excel — ignore all by default

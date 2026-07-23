@@ -1,12 +1,12 @@
-"""Tests for core.compare, driven by the known ground_truth from synth.generate.
+"""Tests for legacy.compare, driven by the known ground_truth from synth.generate.
 
 All imports are absolute from the project root (run with `uv run pytest`).
 """
 
 import pytest
 
-from core.synth import generate
-from core.compare import compare
+from legacy.synth import generate
+from legacy.compare import compare
 
 
 @pytest.fixture

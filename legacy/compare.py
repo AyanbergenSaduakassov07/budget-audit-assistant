@@ -15,12 +15,12 @@ import sys
 import pandas as pd
 
 if __package__ in (None, ""):
-    # Allow running as a plain script (`python core/compare.py`) in addition to
-    # `python -m core.compare`, while keeping absolute imports from the project
-    # root. Under `-m`, __package__ == "core", so this is skipped.
+    # Allow running as a plain script (`python legacy/compare.py`) in addition to
+    # `python -m legacy.compare`, while keeping absolute imports from the project
+    # root. Under `-m`, __package__ == "legacy", so this is skipped.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.schema import normalize
+from legacy.schema import normalize
 
 _KEY = ["item_name", "supplier"]
 
@@ -171,7 +171,7 @@ def compare(df_a: pd.DataFrame, df_b: pd.DataFrame, threshold_pct: float = 15.0)
 
 
 if __name__ == "__main__":
-    from core.synth import generate
+    from legacy.synth import generate
 
     df_a, df_b, ground_truth = generate()
     result = compare(df_a, df_b)

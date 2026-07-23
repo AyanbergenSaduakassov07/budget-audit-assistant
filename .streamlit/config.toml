@@ -1,0 +1,8 @@
+# ACM SPEC design system — navy accent, warm near-white surface.
+# primaryColor drives focus rings, slider, spinner: keep it the accent navy,
+# never red (Streamlit default) and never as a background fill.
+[theme]
+primaryColor = "#1F3A5F"
+backgroundColor = "#FAF9F6"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#2C2C2A"

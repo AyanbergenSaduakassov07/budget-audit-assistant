@@ -7,9 +7,9 @@ two tests that hit it are marked `@pytest.mark.api` and can be deselected with
 
 import pytest
 
-from core.synth import generate_group
-from core.warehouse import build_warehouse, run_sql
-from core.query_engine import answer
+from legacy.synth import generate_group
+from legacy.warehouse import build_warehouse, run_sql
+from legacy.query_engine import answer
 
 
 def test_warehouse_totals_match_dataframe():

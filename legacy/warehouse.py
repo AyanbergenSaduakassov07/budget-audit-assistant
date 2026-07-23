@@ -179,7 +179,7 @@ per-year, or per-category breakdowns.
 
 # --- group analytics aggregations --------------------------------------------
 # Named SUM/GROUP BY helpers for the "Аналитика по группе" dashboard. Kept here
-# (not in app.py) per the architecture rule: all SQL/aggregation lives in core.
+# (not in app.py) per the architecture rule: all SQL/aggregation lives in the data layer (this module), never the UI.
 
 
 def get_group_summary(db_path: str = "procurement.db") -> dict:
@@ -229,7 +229,7 @@ def get_subsidiary_totals(db_path: str = "procurement.db") -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    from core.synth import generate_group
+    from legacy.synth import generate_group
 
     df, _ = generate_group()
     db_path = build_warehouse(df)
