@@ -30,6 +30,7 @@ State model (st.session_state):
 import logging
 import os
 import tempfile
+import uuid
 
 import pandas as pd
 import streamlit as st
@@ -43,7 +44,8 @@ from core.budget_auditor.parser import (
     _best_baseline_col,
 )
 from core.budget_auditor.analysis import workbook_summary_text, year_trend_text, chat_answer
-from core.budget_auditor.narrator_bridge import narrative_opening
+from core.budget_auditor.narrator_bridge import build_audit_result, narrative_opening
+from core.conclusion_generator import generate_conclusion
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +332,31 @@ def _current_threshold() -> float:
     return float(st.session_state.get("yoy_threshold", DEFAULT_THRESHOLD))
 
 
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+@st.cache_data(show_spinner=False)
+def _cached_conclusion_docx(file_bytes: bytes, threshold: float) -> tuple[bytes, str] | None:
+    """Заключение .docx (bytes, filename), cached per (file, threshold) so the
+    Node render runs once, not on every rerun. None on any failure (e.g. node
+    not installed) — the download button is simply not rendered."""
+    try:
+        a = _analyze(file_bytes, threshold)
+        result = build_audit_result(a["meta"], a["combined"])
+        entity = str(result.get("entity") or "компании").strip().replace(" ", "_")
+        filename = f"Заключение_{entity}_{result.get('budget_year') or ''}.docx".replace("_.", ".")
+        out_dir = tempfile.mkdtemp()
+        out_path = generate_conclusion(result, os.path.join(out_dir, filename))
+        with open(out_path, "rb") as fh:
+            data = fh.read()
+        os.unlink(out_path)
+        os.rmdir(out_dir)
+        return data, filename
+    except Exception:
+        logger.exception("conclusion docx generation failed; button not shown")
+        return None
+
+
 @st.cache_data(show_spinner="Формирую заключение…")
 def _cached_opening(file_bytes: bytes, threshold: float) -> str | None:
     """Gemini executive summary for the analysis opening, cached per
@@ -477,6 +504,16 @@ def render_analysis(entry: dict) -> None:
     render_capex_opex(a)
     render_trend(a)
     render_flags(a, _current_threshold())
+    docx = _cached_conclusion_docx(entry["bytes"], _current_threshold())
+    if docx:
+        data, filename = docx
+        st.download_button(
+            "📄 Скачать заключение (.docx)",
+            data=data,
+            file_name=filename,
+            mime=DOCX_MIME,
+            key=f"docx_{entry.get('uid', id(entry))}",
+        )
     st.caption("Задайте вопрос по файлу — например, «сколько CAPEX в 2027» или "
                "«какая ветка тратит больше».")
 
@@ -549,8 +586,10 @@ if submitted:
         f = files[0]
         st.session_state["active_file"] = {"name": f.name, "bytes": f.getvalue()}
         history.append({"role": "user", "content": f"📎 {f.name}"})
-        history.append({"role": "assistant", "kind": "analysis",
-                        "name": f.name, "bytes": f.getvalue()})
+        # uid keeps the download-button widget key unique even when the same
+        # file is uploaded twice in one session.
+        history.append({"role": "assistant", "kind": "analysis", "name": f.name,
+                        "bytes": f.getvalue(), "uid": uuid.uuid4().hex})
     if text:
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": answer_question(text)})

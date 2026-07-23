@@ -34,12 +34,14 @@ def test_adapter_buckets_on_quarterly_fixture(quarterly_result):
     result = build_audit_result(meta, combined)
     s = result["summary"]
 
-    # No baseline year in the fixture -> no АТК; the two quarterly mismatches
-    # land in уточнение; the clean rows are согласовано.
+    # No baseline year in the fixture -> no АТК. Only the CRITICAL quarterly
+    # mismatch escalates to уточнение (minor stays a finding, matching
+    # run_full_audit); the other three rows are согласовано.
     assert s["atk_count"] == 0
-    assert s["clarification_count"] == 2
-    assert s["clarification_amount"] == 200_000
-    assert s["approved_count"] == 2
+    assert s["clarification_count"] == 1
+    assert s["clarification_amount"] == 100_000
+    assert s["approved_count"] == 3
+    assert s["approved_amount"] == 250_000
     assert s["total_rows"] == 4
     assert s["total_amount"] == 350_000
     assert s["has_prior_year_comparison"] is False
@@ -61,7 +63,7 @@ def test_adapter_buckets_on_full_form(full_form_result):
     assert s["has_prior_year_comparison"] is True  # Subsidiary A-style sheet has факт baseline
 
     growth = result["findings"]["growth_flags"]
-    assert list(growth.columns) == ["counterparty", "delta_pct"]
+    assert {"counterparty", "delta_pct"} <= set(growth.columns)
     assert len(growth) == s["atk_count"]
 
 
@@ -128,3 +130,47 @@ def test_narrative_opening_model_error_falls_back(quarterly_result, monkeypatch)
     monkeypatch.setattr(bn, "_get_client", lambda: object())
     monkeypatch.setattr(bn, "_generate_content", lambda client, prompt: "NOT JSON AT ALL")
     assert narrative_opening(meta, combined) is None
+
+
+# --- conclusion .docx bridge (Prompt 5) -----------------------------------------
+def test_conclusion_payload_sections(quarterly_result):
+    """The adapter dict must satisfy conclusion_generator's payload builder:
+    section tables consistent with the summary footers."""
+    from core.conclusion_generator import _build_payload
+
+    meta, combined = quarterly_result
+    payload = _build_payload(build_audit_result(meta, combined))
+
+    assert "ТОО Тест-Дочка" in payload["intro_text"]
+    # АТК: no growth rows; the systemic concentration row is present.
+    tabs = [r["tab"] for r in payload["atk_section"]["rows"]]
+    assert tabs == ["сквозной вопрос"]
+    assert payload["atk_section"]["footer"] == "Итого на АТК: 0 статей"
+    # уточнение: exactly the critical quarterly row, footer matches the table.
+    clar = payload["clarification_section"]["rows"]
+    assert len(clar) == 1
+    assert "расхождение по кварталам: 6%" in clar[0]["reason"]
+    assert payload["clarification_section"]["footer"] == "Итого требуют уточнения: 1 статей"
+    # согласовано: grouped by sheet, 3 rows -> one OPEX group.
+    groups = payload["approved_section"]["groups"]
+    assert [g["label"] for g in groups] == ["OPEX"]
+    assert payload["approved_section"]["footer"] == "Итого согласовано: 3 статей"
+    # Резюме: counts line up with the buckets.
+    totals = {r["decision"]: r["count"] for r in payload["summary_table"]["rows"]}
+    assert totals == {"Выносится на АТК": 0, "Требует уточнения": 1,
+                      "Согласовано": 3, "ИТОГО": 4}
+
+
+def test_conclusion_docx_renders(quarterly_result, tmp_path):
+    """Full render through Node; skipped where node isn't installed."""
+    import shutil
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    from core.conclusion_generator import generate_conclusion
+
+    meta, combined = quarterly_result
+    out = generate_conclusion(build_audit_result(meta, combined),
+                              str(tmp_path / "заключение.docx"))
+    data = (tmp_path / "заключение.docx").read_bytes()
+    assert out.endswith(".docx")
+    assert data[:2] == b"PK" and len(data) > 5_000  # a real zip/docx, not a stub
