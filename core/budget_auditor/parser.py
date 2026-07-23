@@ -280,6 +280,39 @@ def aggregate_workbook(sheets_out):
         frames.append(f)
     if not frames:
         return pd.DataFrame()
+
+    # pandas deprecated (and, as of 3.0, finalized) letting concat's dtype
+    # inference decide the result dtype of a column that's genuinely PRESENT
+    # but entirely pd.NA (object dtype) on one sheet while holding real
+    # numbers on another -- e.g. delta_abs is a real int column on an
+    # Subsidiary A-style OPEX sheet but a bare `pd.NA` broadcast (see flag_rows() /
+    # _flag_quarterly()) on a Subsidiary B-style CAPEX sheet with no baseline year.
+    # Concatenating that mix relies on concat to pick the union dtype (today:
+    # object, since int + object always promotes to object) -- exactly the
+    # inference the warning is about. Make the dtype explicit instead of
+    # inferred: cast every frame's copy of such a column to object before
+    # concatenating, which is the dtype the mix already resolves to, so the
+    # result is unchanged but no longer depends on concat's own inference.
+    # A column entirely ABSENT from a sheet (e.g. fact_2025 on a sheet with no
+    # факт column at all) is a different, ordinary reindex-and-fill case, not
+    # this deprecation, and is deliberately left untouched.
+    all_columns = list(dict.fromkeys(c for f in frames for c in f.columns))
+    unstable_cols = {
+        c for c in all_columns
+        if any(c in f.columns and f[c].dtype == object and f[c].isna().all() for f in frames)
+        and any(c in f.columns and not f[c].isna().all() for f in frames)
+    }
+    if unstable_cols:
+        aligned = []
+        for f in frames:
+            cols_here = unstable_cols & set(f.columns)
+            if cols_here:
+                f = f.copy()
+                for c in cols_here:
+                    f[c] = f[c].astype(object)
+            aligned.append(f)
+        frames = aligned
+
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
