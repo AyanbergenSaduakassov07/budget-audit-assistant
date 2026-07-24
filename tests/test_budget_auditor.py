@@ -193,6 +193,98 @@ def test_chat_answers_span_whole_file(full_form):
         assert reply and fragment in reply, (question, reply)
 
 
+# --- multi-year OPEX/CAPEX breakdown ("...по всем годам" / "...за все года") ----
+def _multi_year_workbook(path):
+    """OPEX + CAPEX sheets sharing campaign year 2027, each carrying three
+    distinct years (fact_2025 / plan_2026 / plan_2027) -- enough to exercise
+    a real per-year breakdown, not just a two-point comparison."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OPEX"
+    _write_meta(ws, campaign_year=2027)
+    hdr = 9
+    _write_headers(ws, hdr, {
+        9: "Контрагент", 10: "2025 год факт",
+        11: "План за 2026 год", 12: "План за 2027 год",
+    })
+    r = hdr + 1
+    ws.cell(row=r, column=3, value="IT-OP-01"); ws.cell(row=r, column=4, value="Связь")
+    r += 1
+    ws.cell(row=r, column=7, value="Услуги связи"); ws.cell(row=r, column=8, value="Интернет")
+    ws.cell(row=r, column=9, value="Телеком Плюс")
+    ws.cell(row=r, column=10, value=8000); ws.cell(row=r, column=11, value=9000); ws.cell(row=r, column=12, value=10000)
+    ws.cell(row=r + 1, column=3, value="Итого"); ws.cell(row=r + 1, column=12, value=10000)
+
+    ws2 = wb.create_sheet("CAPEX")
+    hdr2 = 9
+    _write_headers(ws2, hdr2, {
+        9: "Контрагент", 10: "2025 год факт",
+        11: "План за 2026 год", 12: "План за 2027 год",
+    })
+    r = hdr2 + 1
+    ws2.cell(row=r, column=3, value="IT-CA-01"); ws2.cell(row=r, column=4, value="Оборудование")
+    r += 1
+    ws2.cell(row=r, column=7, value="Серверы"); ws2.cell(row=r, column=9, value="Dell")
+    ws2.cell(row=r, column=10, value=4000); ws2.cell(row=r, column=11, value=4500); ws2.cell(row=r, column=12, value=5000)
+    ws2.cell(row=r + 1, column=3, value="Итого"); ws2.cell(row=r + 1, column=12, value=5000)
+
+    wb.save(path)
+    return path
+
+
+@pytest.fixture(scope="module")
+def multi_year_form(tmp_path_factory):
+    path = tmp_path_factory.mktemp("multi_year") / "multi_year.xlsx"
+    return _run_pipeline(_multi_year_workbook(path))
+
+
+def test_chat_answer_multi_year_capex_opex_breakdown(multi_year_form):
+    meta, _, _, combined = multi_year_form
+    reply = chat_answer("раздели планы на opex/capex по всем годам", combined, meta)
+    assert reply is not None
+    lines = reply.splitlines()
+    assert lines[0] == "Разбивка OPEX/CAPEX по годам:"
+    assert len(lines) == 4  # header + 2025/2026/2027, not a single-year answer
+
+    assert "2025 (Факт): OPEX = 8 000" in reply
+    assert "CAPEX = 4 000" in reply
+    assert "2026 (План): OPEX = 9 000" in reply
+    assert "2027 (План): OPEX = 10 000" in reply
+    assert "OPEX/CAPEX ~ 2.0:1" in reply
+    # First year has no prior year to compare against; later years do.
+    assert "Δ" not in lines[1]
+    assert "Δ +12.5%" in lines[2]  # 8000 -> 9000 and 4000 -> 4500 both +12.5%
+
+
+def test_chat_answer_sravni_multi_year_without_explicit_capex_opex_keyword(multi_year_form):
+    """'сравни' alone (no literal 'capex'/'opex' in the question) still means
+    OPEX-vs-CAPEX in this function -- multi-year phrasing must route it to
+    the same per-year table, not fall through to the single-year branch."""
+    meta, _, _, combined = multi_year_form
+    reply = chat_answer("сравни планы за все года", combined, meta)
+    assert reply is not None
+    assert reply.startswith("Разбивка OPEX/CAPEX по годам:")
+    assert "2025" in reply and "2026" in reply and "2027" in reply
+
+
+def test_chat_answer_multi_year_explicit_range(multi_year_form):
+    meta, _, _, combined = multi_year_form
+    reply = chat_answer("сравни capex с 2026 до 2027", combined, meta)
+    assert reply is not None
+    assert "2025" not in reply  # outside the requested range
+    assert "2026" in reply and "2027" in reply
+
+
+def test_chat_answer_single_year_capex_unaffected_by_multi_year_change(multi_year_form):
+    """Existing single-year behavior must be untouched when no multi-year
+    phrasing is present."""
+    meta, _, _, combined = multi_year_form
+    reply = chat_answer("сколько capex в 2027", combined, meta)
+    assert reply is not None
+    assert "Разбивка" not in reply
+    assert "5 000" in reply
+
+
 # --- chat_answer year-availability branches -------------------------------------
 def _no_target_year_workbook(path):
     """Subsidiary B-style single sheet: campaign year 2027, plan_2027 AND fact_2025 —

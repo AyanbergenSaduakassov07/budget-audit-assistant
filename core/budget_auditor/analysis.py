@@ -160,6 +160,67 @@ def _resolve_year_col(df, year):
     return None
 
 
+# Phrases asking for a year-by-year breakdown instead of one year's figure,
+# plus an explicit "с <year> до/по <year>" range. Used by chat_answer()'s
+# CAPEX/OPEX branches to switch from a single year_col to a per-year table.
+_MULTI_YEAR_MARKERS = ("по всем год", "за все год", "по годам", "по каждому году")
+_YEAR_RANGE_RE = re.compile(r"с\s+(20\d{2})\s+(?:до|по)\s+(20\d{2})")
+
+
+def _detect_multi_year_request(q):
+    """(start, end) for an explicit 'с 2025 до 2027' range, True for a
+    general 'all years' phrase with no explicit range, or False if the
+    question isn't asking for a multi-year breakdown at all."""
+    m = _YEAR_RANGE_RE.search(q)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return any(marker in q for marker in _MULTI_YEAR_MARKERS)
+
+
+def _yoy_delta_str(current, previous):
+    """' (Δ +N.N%)' vs. the previous year in the table, or '' for the first
+    year in the range (nothing to compare against) or a zero/missing base."""
+    if previous is None or not previous:
+        return ""
+    pct = (current - previous) / previous * 100
+    return f" (Δ {pct:+.1f}%)"
+
+
+def _multi_year_capex_opex_answer(combined_df, unit, multi_year):
+    """Per-year OPEX/CAPEX/ratio/Δ% breakdown -- one line per year instead of
+    a single year_col's totals. multi_year is either an explicit (start, end)
+    tuple or True (every year present, from available_years())."""
+    years_present = available_years(combined_df)
+    if isinstance(multi_year, tuple):
+        start, end = multi_year
+        years = [y for y in years_present if start <= y <= end]
+    else:
+        years = list(years_present.keys())
+    if not years:
+        return "Нет годовых данных для запрошенного диапазона лет."
+
+    lines = ["Разбивка OPEX/CAPEX по годам:"]
+    prev_opex = prev_capex = None
+    for year in years:
+        col = _resolve_year_col(combined_df, year)
+        if not col:
+            continue
+        opex = pd.to_numeric(combined_df[combined_df["cost_type"] == "OPEX"][col], errors="coerce").sum()
+        capex = pd.to_numeric(combined_df[combined_df["cost_type"] == "CAPEX"][col], errors="coerce").sum()
+        label = _YEAR_VALUE_LABELS[col.split("_", 1)[0]]
+        ratio = f"{opex / capex:.1f}:1" if capex else "н/д"
+        lines.append(
+            f"{year} ({label}): OPEX = {format_money(opex, unit)}{_yoy_delta_str(opex, prev_opex)}, "
+            f"CAPEX = {format_money(capex, unit)}{_yoy_delta_str(capex, prev_capex)}, "
+            f"OPEX/CAPEX ~ {ratio}"
+        )
+        prev_opex, prev_capex = opex, capex
+
+    if len(lines) == 1:
+        return "Нет данных для расчёта разбивки по годам."
+    return "\n".join(lines)
+
+
 def answer_query(question, df, stats, meta):
     """Deterministic keyword/year/regex based Q&A over one parsed sheet.
     Covers: 'бюджет на <year>', 'сколько потратили на <keyword>',
@@ -254,9 +315,19 @@ def chat_answer(question, combined_df, meta):
 
     wants_capex = "capex" in q or "капекс" in q or "капвлож" in q
     wants_opex = "opex" in q or "опекс" in q or "операционн" in q
+    wants_comparison = "сравни" in q or "сравнение" in q
+
+    # Multi-year OPEX/CAPEX breakdown ("...по всем годам" / "...за все года" /
+    # "...по годам" / an explicit "с 2025 до 2027" range) instead of the
+    # single-year_col branches below. "сравни" without an explicit capex/opex
+    # keyword still routes here -- comparing OPEX vs CAPEX is the only thing
+    # "сравни" means anywhere else in this function.
+    multi_year = _detect_multi_year_request(q)
+    if multi_year and (wants_capex or wants_opex or wants_comparison):
+        return _multi_year_capex_opex_answer(combined_df, unit, multi_year)
 
     # CAPEX vs OPEX comparison
-    if ("сравни" in q or "сравнение" in q) and ("capex" in q or "opex" in q or "капекс" in q or "опекс" in q):
+    if wants_comparison and ("capex" in q or "opex" in q or "капекс" in q or "опекс" in q):
         col = year_col or plan_col
         opex_total = pd.to_numeric(combined_df[combined_df["cost_type"] == "OPEX"][col], errors="coerce").sum()
         capex_total = pd.to_numeric(combined_df[combined_df["cost_type"] == "CAPEX"][col], errors="coerce").sum()
