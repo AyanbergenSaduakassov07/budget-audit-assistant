@@ -8,7 +8,8 @@ per-contract figures out of a third-party API call; the model only ever
 reasons over shapes and aggregates, the same way a human reviewer's summary
 would cite "significant growth at Supplier X" without republishing the ledger.
 
-Uses the same Gemini client/retry plumbing as legacy.query_engine.
+Uses the same pluggable-provider client/retry plumbing as legacy.query_engine
+(Gemini by default, OpenRouter when OPENROUTER_API_KEY is set).
 
 Per SPEC.md architecture rule: this module is pure — no streamlit imports.
 """

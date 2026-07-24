@@ -198,13 +198,14 @@ def _concentration(combined: pd.DataFrame, plan: pd.Series) -> dict:
 
 
 def narrative_opening(meta: dict, combined: pd.DataFrame) -> str | None:
-    """Gemini executive summary + risk level for the opening of the first
-    assistant message. Returns None on ANY failure or when GEMINI_API_KEY is
-    unset — the caller then uses the template summary. Never raises."""
+    """LLM executive summary + risk level for the opening of the first
+    assistant message. Returns None on ANY failure or when no provider key
+    (OPENROUTER_API_KEY or GEMINI_API_KEY) is set — the caller then uses the
+    template summary. Never raises."""
     try:
-        if not os.environ.get("GEMINI_API_KEY"):
+        if not (os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GEMINI_API_KEY")):
             return None
-        # Imported lazily so a missing/broken google-genai install degrades to
+        # Imported lazily so a missing/broken provider SDK install degrades to
         # the template summary instead of taking the whole app down at import.
         from core.budget_narrator import narrate_audit
 

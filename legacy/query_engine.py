@@ -5,67 +5,29 @@ schema description) -> SQL runs against the warehouse -> LLM phrases the answer
 in Russian using ONLY the numbers returned by the database. The model never
 invents figures; every number in the answer comes from the query result.
 
-Uses Google Gemini through its native SDK (`google-genai`), not a vendor-specific SDK.
+The LLM call itself is routed through legacy.llm_providers.get_provider():
+Gemini via its native SDK (`google-genai`) by default, or OpenRouter (openai
+SDK) when OPENROUTER_API_KEY is set. See llm_providers.py for the provider
+interface and the shared retry/backoff + DailyQuotaExhausted contract.
 
 Per SPEC.md architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations
 
-import os
-import time
-
-from google import genai
-from google.genai import errors as genai_errors
-
 from legacy import warehouse
-
-_MODEL = "gemini-flash-lite-latest"
-
-# Retry transient server-side failures (e.g. 503 "high demand", 429 per-minute
-# rate limit) with exponential backoff. These are load spikes on Google's side,
-# not bugs in the request, so a short wait and retry usually clears them.
-_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
-_MAX_ATTEMPTS = 5
-_BASE_DELAY_S = 2.0
-
-# Markers in a 429 error message that identify daily (per-day) quota exhaustion
-# rather than a transient per-minute rate limit. A daily limit will not clear on
-# a short backoff, so retrying is pointless — we surface it immediately instead.
-_DAILY_QUOTA_MARKERS = ("PerDay", "per_day", "RPD")
+from legacy.llm_providers import DailyQuotaExhausted, LLMProvider, get_provider
 
 
-class DailyQuotaExhausted(Exception):
-    """Raised when the free-tier daily API quota is exhausted (not retryable)."""
+def _get_client() -> LLMProvider:
+    """Build the active LLM provider, or fail with a clear message."""
+    return get_provider()
 
 
-def _is_daily_quota_error(exc: genai_errors.APIError) -> bool:
-    """True if a 429 is a per-day quota exhaustion (vs. a per-minute rate limit)."""
-    if exc.code != 429:
-        return False
-    message = str(exc)
-    return any(marker in message for marker in _DAILY_QUOTA_MARKERS)
+def _generate_content(client: LLMProvider, prompt: str) -> str:
+    """Generate text from a prompt via the active provider."""
+    return client.generate_json(prompt)
 
-
-def _generate_content(client: genai.Client, prompt: str) -> str:
-    """Call Gemini with retry + exponential backoff on transient server errors.
-
-    A 429 caused by daily quota exhaustion is not transient — it raises
-    DailyQuotaExhausted immediately so the caller can surface a clear message.
-    """
-    for attempt in range(_MAX_ATTEMPTS):
-        try:
-            response = client.models.generate_content(model=_MODEL, contents=prompt)
-            return response.text or ""
-        except genai_errors.APIError as exc:
-            if _is_daily_quota_error(exc):
-                raise DailyQuotaExhausted(str(exc)) from exc
-            transient = exc.code in _RETRY_STATUS
-            if not transient or attempt == _MAX_ATTEMPTS - 1:
-                raise
-            time.sleep(_BASE_DELAY_S * (2**attempt))
-    # Unreachable: the loop either returns or raises on the final attempt.
-    raise RuntimeError("retry loop exited without a result")
 
 # Few-shot examples pairing Russian questions with the SQL they should produce.
 # They deliberately exercise the Russian category values so the model learns to
@@ -94,18 +56,6 @@ _SQL_EXAMPLES = [
 ]
 
 
-def _get_client() -> genai.Client:
-    """Build the Gemini client, or fail with a clear message."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY environment variable is not set. "
-            "Set it to your Google Gemini API key, e.g.:\n"
-            "    export GEMINI_API_KEY=your_key_here"
-        )
-    return genai.Client(api_key=api_key)
-
-
 def _strip_sql_fences(text: str) -> str:
     """Remove accidental markdown code fences / labels from an SQL response."""
     cleaned = text.strip()
@@ -120,7 +70,7 @@ def _strip_sql_fences(text: str) -> str:
     return cleaned.strip()
 
 
-def _generate_sql(client: genai.Client, question: str, schema_description: str) -> str:
+def _generate_sql(client: LLMProvider, question: str, schema_description: str) -> str:
     """Ask the model to turn a Russian question into a single SQLite SELECT."""
     example_block = "\n\n".join(
         f"Вопрос: {q}\nSQL: {sql}" for q, sql in _SQL_EXAMPLES
@@ -142,10 +92,10 @@ def _generate_sql(client: genai.Client, question: str, schema_description: str) 
         f"Вопрос: {question}\nSQL:"
     )
 
-    return _strip_sql_fences(_generate_content(client, prompt))
+    return _strip_sql_fences(client.generate_sql(prompt))
 
 
-def _phrase_answer(client: genai.Client, question: str, sql: str, result_text: str, empty: bool) -> str:
+def _phrase_answer(client: LLMProvider, question: str, sql: str, result_text: str, empty: bool) -> str:
     """Ask the model to phrase the DB result as a concise Russian answer."""
     if empty:
         data_instruction = (

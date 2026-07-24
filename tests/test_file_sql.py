@@ -106,3 +106,43 @@ def test_success_path_runs_generated_sql(tmp_path, monkeypatch):
     assert answer is not None
     assert captured["empty"] is False
     assert "9800" in captured["result_text"].replace(" ", "")  # 9000 + 800
+
+
+def test_returns_none_on_empty_provider_answer(tmp_path, monkeypatch):
+    """A real OpenRouterProvider whose model returns an empty message.content
+    (observed with Qwen3.6's reasoning mode exhausting the output budget)
+    must degrade to None like any other failure — never surface a blank
+    string as a real answer to app.py."""
+    from legacy.llm_providers import OpenRouterProvider
+
+    class _EmptyMessage:
+        content = ""
+
+    class _EmptyChoice:
+        message = _EmptyMessage()
+
+    class _EmptyResponse:
+        choices = [_EmptyChoice()]
+
+    class _FakeOpenAIClient:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs):
+            return _EmptyResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+    provider = OpenRouterProvider.__new__(OpenRouterProvider)
+    provider._model = "test-model"
+    provider._client = _FakeOpenAIClient()
+
+    monkeypatch.setattr(file_sql, "_get_client", lambda: provider)
+    # SQL generation succeeds with a valid SELECT; only the answer-phrasing
+    # call (also routed through the same provider) returns empty content.
+    monkeypatch.setattr(file_sql, "_generate_sql",
+                        lambda *a, **k: "SELECT SUM(plan_2027) AS total FROM budget_items")
+
+    combined = _subsidiary_b(tmp_path)
+    assert answer_over_file("сколько всего на 2027", combined, {"unit": 1000}) is None
