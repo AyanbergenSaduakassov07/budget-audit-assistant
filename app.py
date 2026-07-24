@@ -531,6 +531,32 @@ def render_analysis(entry: dict) -> None:
                "«какая ветка тратит больше».")
 
 
+_MAX_HISTORY_EXCHANGES = 3
+
+
+def _recent_history_exchanges(n: int = _MAX_HISTORY_EXCHANGES) -> list[tuple[str, str]]:
+    """Last n (question, answer) text pairs from file_chat_history, in order.
+
+    Only plain text user/assistant entries are paired — a file-drop entry
+    (kind="analysis", no "content" field) breaks any pending pair rather than
+    being included, since there's no textual Q&A to hand to the model there.
+    Already-rendered strings, no re-parsing; feeds only the AI SQL fallback
+    (answer_over_file), not the stateless rule-based chat_answer().
+    """
+    pairs: list[tuple[str, str]] = []
+    pending_question: str | None = None
+    for entry in st.session_state.get("file_chat_history", []):
+        if entry.get("kind") == "analysis":
+            pending_question = None
+            continue
+        if entry["role"] == "user":
+            pending_question = entry.get("content")
+        elif entry["role"] == "assistant" and pending_question is not None:
+            pairs.append((pending_question, entry.get("content", "")))
+            pending_question = None
+    return pairs[-n:]
+
+
 def answer_question(question: str) -> str:
     """Route a chat question to core chat_answer() over the active file."""
     active = st.session_state.get("active_file")
@@ -544,9 +570,12 @@ def answer_question(question: str) -> str:
     reply = chat_answer(question, a["combined"], a["meta"])
     if reply is not None:
         return reply
-    # Rule-based path found nothing: try Gemini text-to-SQL over this file's
-    # data. Returns None (silently) if no key / quota / failure -> not-found msg.
-    sql_reply = answer_over_file(question, a["combined"], a["meta"])
+    # Rule-based path found nothing: try Gemini/OpenRouter text-to-SQL over
+    # this file's data, with recent conversation history for follow-ups like
+    # "а за все года". Returns None (silently) if no key / quota / failure ->
+    # not-found msg.
+    history = _recent_history_exchanges()
+    sql_reply = answer_over_file(question, a["combined"], a["meta"], history=history)
     return sql_reply if sql_reply is not None else FALLBACK_REPLY
 
 

@@ -94,7 +94,7 @@ def test_success_path_runs_generated_sql(tmp_path, monkeypatch):
 
     captured = {}
 
-    def _phrase(client, question, sql, result_text, empty):
+    def _phrase(client, question, sql, result_text, empty, history=None):
         captured["sql"] = sql
         captured["result_text"] = result_text
         captured["empty"] = empty
@@ -146,3 +146,71 @@ def test_returns_none_on_empty_provider_answer(tmp_path, monkeypatch):
 
     combined = _subsidiary_b(tmp_path)
     assert answer_over_file("сколько всего на 2027", combined, {"unit": 1000}) is None
+
+
+# --- conversation history threaded into the SQL/answer prompts ------------------
+def test_history_threaded_into_generated_sql_prompt(tmp_path, monkeypatch):
+    """A 2-turn history where the second question only makes sense given the
+    first ('раздели планы на opex/capex по всем годам' then just 'а за все
+    года') -- the prior turn must reach the real _generate_sql()/_phrase_answer()
+    prompts, not be silently dropped."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+    captured = {}
+
+    class _FakeProvider:
+        def generate_sql(self, prompt):
+            captured["sql_prompt"] = prompt
+            return "SELECT SUM(plan_2027) AS total FROM budget_items"
+
+        def generate_json(self, prompt):
+            captured["json_prompt"] = prompt
+            return "Итог найден."
+
+    monkeypatch.setattr(file_sql, "_get_client", lambda: _FakeProvider())
+
+    history = [
+        (
+            "раздели планы на opex/capex по годам",
+            "Разбивка OPEX/CAPEX по годам:\n2027 (План): OPEX = 9 000 тыс., CAPEX = 800 тыс.",
+        ),
+    ]
+
+    combined = _subsidiary_b(tmp_path)
+    answer = answer_over_file("а за все года", combined, {"unit": 1000}, history=history)
+
+    assert answer is not None
+
+    sql_prompt = captured["sql_prompt"]
+    assert "Предыдущие вопросы и ответы" in sql_prompt
+    assert "раздели планы на opex/capex по годам" in sql_prompt
+    assert "9 000 тыс." in sql_prompt  # the prior answer text, not just the question
+    assert "а за все года" in sql_prompt  # the current question is still present
+
+    json_prompt = captured["json_prompt"]
+    assert "Предыдущие вопросы и ответы" in json_prompt
+    assert "раздели планы на opex/capex по годам" in json_prompt
+
+
+def test_no_history_omits_prior_turns_block(tmp_path, monkeypatch):
+    """Without a history argument (the default), the prompt must be identical
+    in shape to before this change -- no empty 'Предыдущие вопросы' block."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+    captured = {}
+
+    class _FakeProvider:
+        def generate_sql(self, prompt):
+            captured["sql_prompt"] = prompt
+            return "SELECT SUM(plan_2027) AS total FROM budget_items"
+
+        def generate_json(self, prompt):
+            return "Итог найден."
+
+    monkeypatch.setattr(file_sql, "_get_client", lambda: _FakeProvider())
+
+    combined = _subsidiary_b(tmp_path)
+    answer = answer_over_file("сколько всего на 2027", combined, {"unit": 1000})
+
+    assert answer is not None
+    assert "Предыдущие вопросы" not in captured["sql_prompt"]

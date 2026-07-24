@@ -56,6 +56,31 @@ _SQL_EXAMPLES = [
 ]
 
 
+# Prior conversation turns let a follow-up like "а за все года" be understood
+# in context (e.g. "the previous OPEX/CAPEX breakdown, but for every year")
+# instead of as a standalone query. Text only -- already-rendered question and
+# answer strings from the chat history, never raw data, so this doesn't touch
+# the existing data-minimization boundary. Capped here (not just by the
+# caller) so any caller passing a longer history still can't inflate prompt
+# size/cost; older turns are dropped, not summarized.
+_MAX_HISTORY_TURNS = 3
+
+
+def _format_history(history: list[tuple[str, str]] | None) -> str:
+    """Last _MAX_HISTORY_TURNS (question, answer) pairs as a labeled prompt
+    block, or '' if there's no history to include."""
+    if not history:
+        return ""
+    recent = history[-_MAX_HISTORY_TURNS:]
+    turns = "\n\n".join(f"Вопрос: {q}\nОтвет: {a}" for q, a in recent)
+    return (
+        "Предыдущие вопросы и ответы в этом диалоге (используй как контекст, "
+        "если текущий вопрос ссылается на них, например «а за все года» или "
+        "«а по кварталам»):\n\n"
+        f"{turns}\n\n---\n\n"
+    )
+
+
 def _strip_sql_fences(text: str) -> str:
     """Remove accidental markdown code fences / labels from an SQL response."""
     cleaned = text.strip()
@@ -70,7 +95,12 @@ def _strip_sql_fences(text: str) -> str:
     return cleaned.strip()
 
 
-def _generate_sql(client: LLMProvider, question: str, schema_description: str) -> str:
+def _generate_sql(
+    client: LLMProvider,
+    question: str,
+    schema_description: str,
+    history: list[tuple[str, str]] | None = None,
+) -> str:
     """Ask the model to turn a Russian question into a single SQLite SELECT."""
     example_block = "\n\n".join(
         f"Вопрос: {q}\nSQL: {sql}" for q, sql in _SQL_EXAMPLES
@@ -89,6 +119,7 @@ def _generate_sql(client: LLMProvider, question: str, schema_description: str) -
         f"{schema_description}\n"
         "Examples:\n"
         f"{example_block}\n\n"
+        f"{_format_history(history)}"
         f"Вопрос: {question}\nSQL:"
     )
 
@@ -108,7 +139,14 @@ _NUMBER_FORMAT_INSTRUCTION = (
 )
 
 
-def _phrase_answer(client: LLMProvider, question: str, sql: str, result_text: str, empty: bool) -> str:
+def _phrase_answer(
+    client: LLMProvider,
+    question: str,
+    sql: str,
+    result_text: str,
+    empty: bool,
+    history: list[tuple[str, str]] | None = None,
+) -> str:
     """Ask the model to phrase the DB result as a concise Russian answer."""
     if empty:
         data_instruction = (
@@ -125,6 +163,7 @@ def _phrase_answer(client: LLMProvider, question: str, sql: str, result_text: st
     prompt = (
         "Ты аналитик по закупкам компании. Отвечай на русском языке, кратко и по делу. "
         "Все числа бери строго из результата SQL-запроса, ничего не придумывай.\n\n"
+        f"{_format_history(history)}"
         f"Вопрос пользователя: {question}\n\n"
         f"Выполненный SQL:\n{sql}\n\n"
         f"Результат запроса:\n{result_text}\n\n"

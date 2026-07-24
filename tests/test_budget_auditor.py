@@ -475,6 +475,46 @@ def test_formatters_handle_all_na_variants(app_helpers):
     assert app_helpers["_pct"](-12.34) == "-12.3%"
 
 
+# --- conversation history pairing for the AI SQL fallback (Prompt 3) ------------
+def test_recent_history_exchanges_pairs_and_skips_file_drop(app_helpers):
+    import streamlit as st
+
+    st.session_state["file_chat_history"] = [
+        {"role": "user", "content": "вопрос 1"},
+        {"role": "assistant", "content": "ответ 1"},
+        {"role": "user", "content": "📎 file.xlsx"},
+        {"role": "assistant", "kind": "analysis", "name": "file.xlsx", "bytes": b"", "uid": "x"},
+        {"role": "user", "content": "вопрос 2"},
+        {"role": "assistant", "content": "ответ 2"},
+    ]
+    try:
+        pairs = app_helpers["_recent_history_exchanges"]()
+    finally:
+        st.session_state.pop("file_chat_history", None)
+
+    # The file-drop pair must not appear as a (possibly malformed) exchange.
+    assert pairs == [("вопрос 1", "ответ 1"), ("вопрос 2", "ответ 2")]
+
+
+def test_recent_history_exchanges_caps_to_three(app_helpers):
+    import streamlit as st
+
+    st.session_state["file_chat_history"] = [
+        entry
+        for i in range(1, 6)
+        for entry in (
+            {"role": "user", "content": f"вопрос {i}"},
+            {"role": "assistant", "content": f"ответ {i}"},
+        )
+    ]
+    try:
+        pairs = app_helpers["_recent_history_exchanges"]()
+    finally:
+        st.session_state.pop("file_chat_history", None)
+
+    assert pairs == [("вопрос 3", "ответ 3"), ("вопрос 4", "ответ 4"), ("вопрос 5", "ответ 5")]
+
+
 # --- units-mismatch sanity check -------------------------------------------------
 def test_year_trend_flags_unit_mismatch():
     fake = pd.DataFrame({

@@ -9,7 +9,7 @@ import pytest
 
 from legacy.synth import generate_group
 from legacy.warehouse import build_warehouse, run_sql
-from legacy.query_engine import _phrase_answer, answer
+from legacy.query_engine import _format_history, _phrase_answer, answer
 
 
 # --- number formatting in the phrased answer (regression) -----------------------
@@ -40,6 +40,29 @@ def test_phrase_answer_prompt_forbids_scientific_notation():
     assert "экспоненциальн" in prompt.lower()
     assert "разделител" in prompt.lower()
     assert result == "155 903 400 000 тенге"
+
+
+# --- conversation history formatting (regression) --------------------------------
+def test_format_history_empty_is_blank():
+    assert _format_history(None) == ""
+    assert _format_history([]) == ""
+
+
+def test_format_history_includes_question_and_answer():
+    block = _format_history([("сколько CAPEX в 2027", "CAPEX на 2027 год: 800 тыс.")])
+    assert "Предыдущие вопросы и ответы" in block
+    assert "сколько CAPEX в 2027" in block
+    assert "CAPEX на 2027 год: 800 тыс." in block
+
+
+def test_format_history_caps_to_last_three_turns():
+    """Older turns are dropped (not summarized) past _MAX_HISTORY_TURNS."""
+    history = [(f"вопрос {i}", f"ответ {i}") for i in range(1, 6)]  # 5 turns
+    block = _format_history(history)
+    for i in (1, 2):
+        assert f"вопрос {i}" not in block
+    for i in (3, 4, 5):
+        assert f"вопрос {i}" in block
 
 
 def test_warehouse_totals_match_dataframe():

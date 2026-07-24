@@ -157,8 +157,20 @@ Money columns (REAL, суммы в {unit_label}):
 """
 
 
-def answer_over_file(question: str, combined: pd.DataFrame, meta: dict) -> str | None:
+def answer_over_file(
+    question: str,
+    combined: pd.DataFrame,
+    meta: dict,
+    history: list[tuple[str, str]] | None = None,
+) -> str | None:
     """Answer a question via Gemini text-to-SQL over the current file's data.
+
+    history: the last few (question, answer) text pairs from the chat, in
+    order, so a follow-up like "а за все года" is understood against the
+    prior turn instead of in isolation — passed straight through to
+    _generate_sql/_phrase_answer, which cap and label it in the prompt (see
+    legacy.query_engine._format_history). Text only, no raw data, so this
+    doesn't touch the existing data-minimization boundary.
 
     Returns the Russian answer string, or None on ANY failure (missing key,
     quota, empty data, bad SQL, no numeric columns) — the caller then shows its
@@ -178,10 +190,10 @@ def answer_over_file(question: str, combined: pd.DataFrame, meta: dict) -> str |
     try:
         db_path = _load_temp_db(combined, dims, money)
         schema = _schema_description(combined, meta or {}, dims, money)
-        sql = _generate_sql(client, question, schema)
+        sql = _generate_sql(client, question, schema, history=history)
         df = warehouse.run_sql(sql, db_path)
         result_text = df.to_string(index=False) if not df.empty else "(пустой результат)"
-        answer = _phrase_answer(client, question, sql, result_text, empty=df.empty)
+        answer = _phrase_answer(client, question, sql, result_text, empty=df.empty, history=history)
         return answer or None
     except DailyQuotaExhausted:
         return None
