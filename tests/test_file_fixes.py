@@ -9,6 +9,14 @@ a real ACM file (a sample budget form):
      as a critical mismatch when summed against the annual plan.
   4. a counterparty cell naming more than one legal entity (compound cell)
      must not be attributed to a single supplier's concentration risk.
+  5. the footer-detection fix for #2 was itself a regression (searching
+     every column false-positived on free-text prose; a real per-section
+     subtotal repeats after EVERY budget code, not just once) -- fixed to
+     code-column-only sheet end + a non-terminating per-row subtotal skip.
+  6. a non-code value in the code column (a real file's preparer name,
+     "НЕКОДОВОЕ_ЗНАЧЕНИЕ") on rows that also carry real leaf data must not be treated as
+     a fresh code declaration; multi-row item groups (category on the first
+     row only) must forward-fill within the open section.
 
 Each fixture reproduces the exact pattern, not just a generic variant.
 """
@@ -335,3 +343,110 @@ def test_genuine_sheet_end_label_still_stops_parsing(tmp_path):
     df = sheets["OPEX"]["df"]
     assert "Не должно попасть" not in df["item_name"].tolist()
     assert pd.to_numeric(df["plan_2026"], errors="coerce").sum() == 6000
+
+
+# --- 6. non-code value in the code column (real file: "НЕКОДОВОЕ_ЗНАЧЕНИЕ") ------------------
+# A real file put the preparer's NAME in the Статья бюджета column on rows that
+# also carried real category+item+value data, and on multi-row item groups where
+# only the first row of the group carried category at all:
+#   (a) code="НЕКОДОВОЕ_ЗНАЧЕНИЕ" + category + value on the SAME row -- must be captured as a
+#       leaf under the section that's actually open (the last real code), not
+#       treated as a fresh (bogus) declaration that discards the row's own data.
+#   (b) code="НЕКОДОВОЕ_ЗНАЧЕНИЕ" + category but NO value on that row (a legitimately unfilled
+#       item) -- must not corrupt cur_code for the real leaf rows that follow.
+#   (c) a multi-row item group: category on the first row only, continuation rows
+#       carry just their own value with category/subcategory blank -- must still
+#       be recognized as leaf rows via forward-fill within the open section.
+def _non_code_value_in_code_column_workbook(path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "CAPEX"
+    _write_meta(ws, campaign_year=2027)
+    hdr = 9
+    _write_headers(ws, hdr, {9: "Контрагент", 11: "План за 2027 год"})
+    r = hdr + 1
+    ws.cell(row=r, column=3, value="IT-CA-01"); ws.cell(row=r, column=4, value="Оборудование")
+    r += 1  # (a) non-code value + its own category + its own value
+    ws.cell(row=r, column=3, value="НЕКОДОВОЕ_ЗНАЧЕНИЕ")
+    ws.cell(row=r, column=7, value="Источники бесперебойного питания")
+    ws.cell(row=r, column=9, value="ИБП 2000ВА"); ws.cell(row=r, column=11, value=2151.5)
+    r += 1  # (b) non-code value + category but NO value this row -- must not corrupt cur_code
+    ws.cell(row=r, column=3, value="НЕКОДОВОЕ_ЗНАЧЕНИЕ")
+    ws.cell(row=r, column=7, value="Оснащение гермозон")
+    r += 1  # (c) multi-row group: category on first row only
+    ws.cell(row=r, column=3, value="НЕКОДОВОЕ_ЗНАЧЕНИЕ")
+    ws.cell(row=r, column=7, value="Компьютерная техника")
+    ws.cell(row=r, column=9, value="Монитор"); ws.cell(row=r, column=11, value=3847.9)
+    r += 1  # continuation rows: blank category, own item + value
+    ws.cell(row=r, column=9, value="Системный блок"); ws.cell(row=r, column=11, value=32817.7)
+    r += 1
+    ws.cell(row=r, column=9, value="Ноутбук"); ws.cell(row=r, column=11, value=8307)
+    ws.cell(row=r + 1, column=3, value="Общий результат"); ws.cell(row=r + 1, column=11, value=47124.1)
+    wb.save(path)
+    return path
+
+
+def test_non_code_value_with_own_data_captured_under_open_section(tmp_path):
+    path = _non_code_value_in_code_column_workbook(tmp_path / "non_code.xlsx")
+    _, sheets = parse_workbook(path)
+    df = sheets["CAPEX"]["df"]
+
+    # All leaf rows belong to IT-CA-01 -- "НЕКОДОВОЕ_ЗНАЧЕНИЕ" must never appear as a code.
+    assert set(df["statya_code"]) == {"IT-CA-01"}
+    assert "НЕКОДОВОЕ_ЗНАЧЕНИЕ" not in df["statya_code"].tolist()
+
+
+def test_non_code_value_without_data_does_not_corrupt_later_sections(tmp_path):
+    path = _non_code_value_in_code_column_workbook(tmp_path / "non_code2.xlsx")
+    _, sheets = parse_workbook(path)
+    df = sheets["CAPEX"]["df"]
+
+    # The "НЕКОДОВОЕ_ЗНАЧЕНИЕ" + category-but-no-value row must not become cur_code, or
+    # every leaf row after it (the multi-row group) would misattribute to it.
+    assert pd.to_numeric(df["plan_2027"], errors="coerce").sum() == pytest.approx(
+        2151.5 + 3847.9 + 32817.7 + 8307
+    )
+
+
+def test_multi_row_item_group_forward_fills_category(tmp_path):
+    path = _non_code_value_in_code_column_workbook(tmp_path / "non_code3.xlsx")
+    _, sheets = parse_workbook(path)
+    df = sheets["CAPEX"]["df"]
+
+    # 4 real leaf rows total: ИБП + Монитор + Системный блок + Ноутбук.
+    # "Оснащение гермозон" (category, no value) correctly excluded.
+    assert len(df) == 4
+    # The continuation row (own value 32817.7, no category of its own) must
+    # still be captured, with category forward-filled from the group's first
+    # row -- item_name has no col-9 fallback, so it also reads the
+    # forward-filled category, same as the group's first row.
+    continuation = df[df["plan_2027"] == 32817.7]
+    assert len(continuation) == 1
+    assert continuation.iloc[0]["category"] == "Компьютерная техника"
+    assert continuation.iloc[0]["item_name"] == "Компьютерная техника"
+
+
+def test_malformed_code_declaration_without_data_still_flags_anomalous(tmp_path):
+    """A malformed-but-genuine code declaration (own row has no category/value
+    of its own) must still be treated as a declaration -- distinguishing this
+    from the "НЕКОДОВОЕ_ЗНАЧЕНИЕ" case is what makes the fix precise, not a blanket
+    "ignore any non-code value" rule."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OPEX"
+    _write_meta(ws, campaign_year=2026)
+    hdr = 9
+    _write_headers(ws, hdr, {9: "Контрагент", 11: "План за 2026 год"})
+    r = hdr + 1
+    ws.cell(row=r, column=3, value="IT-CA-1"); ws.cell(row=r, column=4, value="Оборудование")
+    r += 1
+    ws.cell(row=r, column=7, value="Оборудование"); ws.cell(row=r, column=8, value="Серверы")
+    ws.cell(row=r, column=9, value="Dell"); ws.cell(row=r, column=11, value=2000)
+    ws.cell(row=r + 1, column=3, value="Общий результат"); ws.cell(row=r + 1, column=11, value=2000)
+    path = tmp_path / "malformed.xlsx"
+    wb.save(path)
+
+    _, sheets = parse_workbook(path)
+    df = sheets["OPEX"]["df"]
+    assert df["statya_code"].tolist() == ["IT-CA-1"]
+    assert df["anomalous_code_flag"].tolist() == [True]

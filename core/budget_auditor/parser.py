@@ -211,6 +211,7 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
 
     rows = []
     cur_code, cur_code_name = None, None
+    cur_category, cur_subcat = None, None
     n_blank = n_category = n_leaf = 0
 
     for r in range(header_row + 1, ws.max_row + 1):
@@ -228,18 +229,49 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
         subcat = ws.cell(row=r, column=8).value
         plan_val = ws.cell(row=r, column=plan_year_col).value if plan_year_col else None
 
-        if code:
+        # A code cell only counts as a genuine section declaration if it
+        # looks like a real code, OR the row has no category/subcategory of
+        # its own (the shape of a real declaration row in every file
+        # examined: col C + col D only, nothing else). A real file was seen
+        # with the PREPARER'S NAME in this column ("НЕКОДОВОЕ_ЗНАЧЕНИЕ" -- not a code,
+        # not empty) on rows that also carried real category/item text;
+        # treating that as a new declaration silently discarded the row's
+        # own data. Deliberately NOT keyed to plan_val/the campaign-year
+        # column specifically: a row can have real category/item data but no
+        # *current-year* number (e.g. only a fact_2025 or plan_2026 value) --
+        # it's still a data row, not a declaration, even though this year's
+        # plan is empty for it. When neither holds, cur_code is left as-is
+        # (the row still belongs to whatever section is already open) and
+        # the row falls through to be evaluated as a leaf below.
+        if code and (_is_valid_budget_code(code) or not (category or subcat)):
             cur_code, cur_code_name = code, code_name
+            cur_category, cur_subcat = None, None
             continue
 
         # A bare per-section subtotal ("Результат"/"Итого" alone in category
         # or subcategory) repeats after every budget-code section in real
         # files -- exclude just this row, keep reading the sections after it.
         if _is_section_subtotal_row(category, subcat):
+            cur_category, cur_subcat = None, None
             n_blank += 1
             continue
 
-        is_leaf = isinstance(plan_val, (int, float)) and bool(category or subcat)
+        # Real files also split one leaf item's category label across
+        # several rows: a "group header" row carries category (and often its
+        # own item+value), then continuation rows repeat only the value with
+        # category/subcategory left blank. Forward-fill within the open
+        # section so continuation rows are still recognized as leaf rows
+        # instead of being silently dropped for lacking a category of their
+        # own -- a no-op for forms where every leaf row already carries its
+        # own category/subcategory (e.g. Subsidiary A-style forms).
+        if category:
+            cur_category = category
+        if subcat:
+            cur_subcat = subcat
+        eff_category = category or cur_category
+        eff_subcat = subcat or cur_subcat
+
+        is_leaf = isinstance(plan_val, (int, float)) and bool(eff_category or eff_subcat)
         if not is_leaf:
             if category and not subcat:
                 n_category += 1
@@ -252,9 +284,9 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
             "sheet": sheet_name,
             "statya_code": cur_code,
             "statya_name": cur_code_name,
-            "category": category,
-            "subcategory": subcat,
-            "item_name": subcat or category,
+            "category": eff_category,
+            "subcategory": eff_subcat,
+            "item_name": eff_subcat or eff_category,
             # A code that doesn't match the "AA-AA-00"-style format is a
             # data-quality warning, not a parse failure -- surfaced downstream
             # (workbook_summary_text, the flagged-статьи UI), never fatal.
