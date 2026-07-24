@@ -233,10 +233,10 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
         # looks like a real code, OR the row has no category/subcategory of
         # its own (the shape of a real declaration row in every file
         # examined: col C + col D only, nothing else). A real file was seen
-        # with the PREPARER'S NAME in this column ("НЕКОДОВОЕ_ЗНАЧЕНИЕ" -- not a code,
-        # not empty) on rows that also carried real category/item text;
-        # treating that as a new declaration silently discarded the row's
-        # own data. Deliberately NOT keyed to plan_val/the campaign-year
+        # with a non-code text value in this column (not a code, not empty)
+        # on rows that also carried real category/item text; treating that
+        # as a new declaration silently discarded the row's own data.
+        # Deliberately NOT keyed to plan_val/the campaign-year
         # column specifically: a row can have real category/item data but no
         # *current-year* number (e.g. only a fact_2025 or plan_2026 value) --
         # it's still a data row, not a declaration, even though this year's
