@@ -9,7 +9,37 @@ import pytest
 
 from legacy.synth import generate_group
 from legacy.warehouse import build_warehouse, run_sql
-from legacy.query_engine import answer
+from legacy.query_engine import _phrase_answer, answer
+
+
+# --- number formatting in the phrased answer (regression) -----------------------
+# A real answer over a workbook-wide total leaked pandas' scientific notation
+# straight into the Russian text ("1.5e+11 тенге"). The model, not our
+# code, does the formatting, so the only thing we can pin down is that the
+# prompt actually instructs it not to do that.
+def test_phrase_answer_prompt_forbids_scientific_notation():
+    captured = {}
+
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            captured["prompt"] = prompt
+            return "155 903 400 000 тенге"
+
+        def generate_sql(self, prompt):
+            return ""
+
+    result = _phrase_answer(
+        _FakeProvider(),
+        "Какая общая сумма закупок за все годы?",
+        "SELECT SUM(subtotal) FROM procurements",
+        "1.5e+11",
+        empty=False,
+    )
+
+    prompt = captured["prompt"]
+    assert "экспоненциальн" in prompt.lower()
+    assert "разделител" in prompt.lower()
+    assert result == "155 903 400 000 тенге"
 
 
 def test_warehouse_totals_match_dataframe():

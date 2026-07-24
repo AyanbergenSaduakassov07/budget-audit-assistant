@@ -478,6 +478,18 @@ def render_flags(a: dict, threshold: float) -> None:
             out = _format_eager(disp, fmt)
             st.dataframe(out.where(out.notna(), "—"), use_container_width=True, hide_index=True)
 
+    d = subset("anomalous_code_flag")
+    if d.empty:
+        st.caption("✓ Все коды статей соответствуют формату (например IT-CA-01).")
+    else:
+        with st.expander(f"Нестандартный формат кода статьи — {len(d)}"):
+            st.caption(
+                "Код статьи не соответствует ожидаемому формату (например IT-CA-01) — "
+                "предупреждение о качестве данных, возможна опечатка или нестандартная "
+                "нумерация. Не влияет на решение по статье."
+            )
+            render_flag_view(d, a["plan_col"])
+
 
 def render_analysis(entry: dict) -> None:
     """The full file analysis as ONE assistant message body."""

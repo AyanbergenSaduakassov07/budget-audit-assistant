@@ -95,6 +95,19 @@ def _generate_sql(client: LLMProvider, question: str, schema_description: str) -
     return _strip_sql_fences(client.generate_sql(prompt))
 
 
+# SQL result frames can hold very large sums (e.g. workbook-wide totals in
+# raw тенге); pandas' df.to_string() renders those in scientific notation
+# (e.g. "1.5e+11"), and a model asked to "use only the numbers from the
+# result" can copy that notation straight into the Russian answer. Applies
+# to both query_engine.answer() and the file_sql fallback (_phrase_answer is
+# shared by both — see core.budget_auditor.file_sql).
+_NUMBER_FORMAT_INSTRUCTION = (
+    "Число пиши полностью, с разделителями разрядов (пробел между группами "
+    "по три цифры, например 155 903 400 000), а НЕ в экспоненциальной записи "
+    "(никогда не пиши вида 1.5e+11)."
+)
+
+
 def _phrase_answer(client: LLMProvider, question: str, sql: str, result_text: str, empty: bool) -> str:
     """Ask the model to phrase the DB result as a concise Russian answer."""
     if empty:
@@ -106,7 +119,7 @@ def _phrase_answer(client: LLMProvider, question: str, sql: str, result_text: st
         data_instruction = (
             "Ответь на вопрос по-русски, кратко, указав конкретные числа из "
             "результата запроса. Используй ТОЛЬКО числа из результата — ничего "
-            "не выдумывай. Суммы в тенге (KZT)."
+            "не выдумывай. Суммы в тенге (KZT). " + _NUMBER_FORMAT_INSTRUCTION
         )
 
     prompt = (

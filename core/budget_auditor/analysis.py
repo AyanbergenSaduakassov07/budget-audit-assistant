@@ -95,6 +95,14 @@ def sheet_summary_text(sheet_name, meta, df, stats):
     if n_high_price:
         parts.append(f"{n_high_price} статей входят в верхние 10% по стоимости на этом листе -- потенциально рискованные по цене позиции.")
 
+    n_anomalous_code = int(df["anomalous_code_flag"].sum()) if "anomalous_code_flag" in df else 0
+    if n_anomalous_code:
+        parts.append(
+            f"{n_anomalous_code} статей имеют код, не соответствующий ожидаемому формату "
+            f"(например IT-CA-01) -- это предупреждение о качестве данных, а не ошибка "
+            f"расчёта; проверьте вручную, возможна опечатка или нестандартная нумерация."
+        )
+
     return " ".join(parts)
 
 

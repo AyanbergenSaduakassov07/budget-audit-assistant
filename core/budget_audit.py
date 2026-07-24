@@ -18,6 +18,8 @@ corporate_ingest's "detect whichever columns exist" approach.
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from core.corporate_ingest import canonicalize
@@ -28,15 +30,37 @@ _MISSING_CHECK_COLUMNS = ["counterparty", "contract", "article_code", "expense_t
 _NEW_ITEM_FLAG = "новая статья"
 _NO_PRIOR_YEAR_FLAG = "нет данных прошлого года"
 
+# See core.budget_auditor.narrator_bridge._is_compound_counterparty — a cell
+# with more than one legal-entity marker names multiple suppliers in one row,
+# not one compound-named supplier.
+_LEGAL_MARKER_RE = re.compile(r"\b(?:ТОО|АО|ИП|ЧП)\b")
+_COMPOUND_COUNTERPARTY_LABEL = "несколько контрагентов в одной строке"
+
 
 def _blank_mask(series: pd.Series) -> pd.Series:
     """True where a value is null or an empty/whitespace-only string."""
     return series.isna() | series.astype(str).str.strip().eq("")
 
 
+def _is_compound_counterparty(name) -> bool:
+    if name is None:
+        return False
+    return len(_LEGAL_MARKER_RE.findall(str(name))) > 1
+
+
 # --- RULE 1: quarterly reconciliation -----------------------------------------
 def quarterly_reconciliation(df: pd.DataFrame) -> pd.DataFrame:
-    """Flag rows where q1+q2+q3+q4 doesn't add up to the annual plan (>1% off)."""
+    """Flag rows where the quarters don't add up to the annual plan (>1% off).
+
+    Some subsidiaries report quarters нарастающим итогом (cumulative -- Q4
+    already IS the annual total) rather than discrete per-quarter amounts;
+    summing four cumulative quarters against the annual figure flags every
+    row "critical" (100% false positive). A row counts as cumulative when Q4
+    is within ~1% of plan_annual AND q1<=q2<=q3<=q4 (non-decreasing), in
+    which case Q4 is compared directly to plan_annual instead of the
+    four-quarter sum. See core.budget_auditor.parser._flag_quarterly, which
+    mirrors this same detection on the dynamic per-year column names.
+    """
     out_columns = [
         "counterparty", "article_code", "expense_type",
         "plan_annual", "quarterly_sum", "difference", "difference_pct", "severity",
@@ -52,10 +76,16 @@ def quarterly_reconciliation(df: pd.DataFrame) -> pd.DataFrame:
     if work.empty:
         return pd.DataFrame(columns=out_columns)
 
-    quarterly_sum = work[_QUARTER_COLUMNS].sum(axis=1)
+    q1, q2, q3, q4 = (work[c] for c in _QUARTER_COLUMNS)
+    discrete_sum = work[_QUARTER_COLUMNS].sum(axis=1)
+    positive_annual = work["plan_annual"] > 0
+    q4_gap_pct = (work["plan_annual"] - q4).abs() / work["plan_annual"].replace(0, pd.NA) * 100
+    monotonic = (q1 <= q2) & (q2 <= q3) & (q3 <= q4)
+    is_cumulative = positive_annual & monotonic & (q4_gap_pct <= 1.0)
+
+    quarterly_sum = discrete_sum.where(~is_cumulative, q4)
     difference = work["plan_annual"] - quarterly_sum
     difference_pct = pd.Series(0.0, index=work.index)
-    positive_annual = work["plan_annual"] > 0
     difference_pct[positive_annual] = (
         difference[positive_annual].abs() / work.loc[positive_annual, "plan_annual"] * 100
     )
@@ -123,7 +153,13 @@ def year_over_year_analysis(df: pd.DataFrame, atk_threshold: float = 50.0) -> pd
 
 # --- RULE 3: supplier concentration risk ---------------------------------------
 def concentration_risk(df: pd.DataFrame) -> dict:
-    """Per-supplier share of total plan_annual; flag suppliers over 40% share."""
+    """Per-supplier share of total plan_annual; flag suppliers over 40% share.
+
+    A counterparty cell with more than one legal-entity marker (e.g.
+    "ТОО Альфа, АО Бета") is grouped under _COMPOUND_COUNTERPARTY_LABEL
+    instead of its raw text — it names multiple suppliers in one row, not one
+    real supplier, so it can never set risk_flag, win top_supplier, or drive
+    concentration_flag. It still appears in supplier_breakdown for visibility."""
     breakdown_columns = ["counterparty", "total_amount", "share_pct", "single_source_rows", "risk_flag"]
     empty_result = {
         "supplier_breakdown": pd.DataFrame(columns=breakdown_columns),
@@ -154,21 +190,33 @@ def concentration_risk(df: pd.DataFrame) -> dict:
         }
 
     named["_no_contract"] = contract_blank.loc[named.index]
-    grouped = named.groupby("counterparty", as_index=False).agg(
+    is_compound = named["counterparty"].apply(_is_compound_counterparty)
+    named["_group_key"] = named["counterparty"].where(~is_compound, _COMPOUND_COUNTERPARTY_LABEL)
+
+    grouped = named.groupby("_group_key", as_index=False).agg(
         total_amount=("plan_annual", "sum"),
         single_source_rows=("_no_contract", "sum"),
-    )
+    ).rename(columns={"_group_key": "counterparty"})
     grouped["single_source_rows"] = grouped["single_source_rows"].astype(int)
     grouped["share_pct"] = grouped["total_amount"] / total_budget * 100
-    grouped["risk_flag"] = grouped["share_pct"] > 40
+    grouped["risk_flag"] = (grouped["share_pct"] > 40) & (grouped["counterparty"] != _COMPOUND_COUNTERPARTY_LABEL)
     grouped = grouped.sort_values("share_pct", ascending=False).reset_index(drop=True)
     breakdown = grouped[breakdown_columns]
 
+    real = breakdown[breakdown["counterparty"] != _COMPOUND_COUNTERPARTY_LABEL]
+    if real.empty:
+        return {
+            **empty_result,
+            "supplier_breakdown": breakdown,
+            "total_single_source_amount": total_single_source_amount,
+            "total_single_source_pct": total_single_source_amount / total_budget * 100,
+        }
+
     return {
         "supplier_breakdown": breakdown,
-        "concentration_flag": bool(breakdown["risk_flag"].any()),
-        "top_supplier": str(breakdown.iloc[0]["counterparty"]),
-        "top_supplier_pct": float(breakdown.iloc[0]["share_pct"]),
+        "concentration_flag": bool(real["risk_flag"].any()),
+        "top_supplier": str(real.iloc[0]["counterparty"]),
+        "top_supplier_pct": float(real.iloc[0]["share_pct"]),
         "total_single_source_amount": total_single_source_amount,
         "total_single_source_pct": total_single_source_amount / total_budget * 100,
     }

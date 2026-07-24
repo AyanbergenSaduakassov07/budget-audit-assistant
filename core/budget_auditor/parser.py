@@ -71,11 +71,41 @@ COLUMN_SIGNATURES = {
     "justification": "обоснование",
 }
 
+# Budget-code format confirmed against real files (e.g. "IT-CA-01"): 2-4
+# uppercase letters, a 2-letter subsection, a 2-digit sequence number, all
+# hyphen-separated. Checked case-sensitively against the raw cell text (not
+# _norm(), which lowercases) -- codes are always stored uppercase in the
+# source files.
+_CODE_RE = re.compile(r"^[A-Z]{2,4}-[A-Z]{2}-\d{2}$")
+
+# Footer/grand-total marker. A footer row can put this word in ANY column --
+# a real file was seen with the totals in a row whose CATEGORY column (not
+# the code column) read "Результат", one row above an "Общий результат"
+# label with no numbers. Checking only the code column let that totals row
+# slip through as an ordinary leaf line item before the label row (one row
+# later) finally triggered the break -- silently double-counting the total.
+_FOOTER_RE = re.compile(r"итог|результат")
+
 
 def _norm(s):
     if s is None:
         return ""
     return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+
+def _is_valid_budget_code(code) -> bool:
+    if code is None:
+        return False
+    return bool(_CODE_RE.match(str(code).strip()))
+
+
+def _is_footer_row(ws, row, max_col) -> bool:
+    """True if ANY column in this row carries a footer/grand-total marker."""
+    for c in range(1, max_col + 1):
+        v = ws.cell(row=row, column=c).value
+        if v and _FOOTER_RE.search(_norm(v)):
+            return True
+    return False
 
 
 def read_metadata(ws):
@@ -167,6 +197,14 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
     n_blank = n_category = n_leaf = 0
 
     for r in range(header_row + 1, ws.max_row + 1):
+        # Every form ends with a grand-total block. The footer marker can land
+        # in ANY column of the row (not just the code column -- see
+        # _is_footer_row), so this must be checked before anything else, or a
+        # totals row with the marker in e.g. the category column gets ingested
+        # as an ordinary leaf line item and silently doubles the total.
+        if _is_footer_row(ws, r, max_col):
+            break
+
         code = ws.cell(row=r, column=3).value
         code_name = ws.cell(row=r, column=4).value
         category = ws.cell(row=r, column=7).value
@@ -174,13 +212,6 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
         plan_val = ws.cell(row=r, column=plan_year_col).value if plan_year_col else None
 
         if code:
-            # Every form ends with a grand-total block whose code cell reads
-            # something like "Общий результат" (not a real Статья бюджета
-            # code) followed by a row that repeats the sum in the same plan
-            # column. If we don't stop here, that footer sum gets ingested
-            # as if it were one more line item and silently doubles the total.
-            if re.search(r"итог|результат", _norm(code)):
-                break
             cur_code, cur_code_name = code, code_name
             continue
 
@@ -200,6 +231,10 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
             "category": category,
             "subcategory": subcat,
             "item_name": subcat or category,
+            # A code that doesn't match the "AA-AA-00"-style format is a
+            # data-quality warning, not a parse failure -- surfaced downstream
+            # (workbook_summary_text, the flagged-статьи UI), never fatal.
+            "anomalous_code_flag": not _is_valid_budget_code(cur_code),
         }
         for role, c in colmap.items():
             if role in ("statya_code", "category", "subcategory"):
@@ -226,6 +261,7 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
         "has_justification": "justification" in colmap,
         "plan_year": plan_year,
         "years_present": years_present,
+        "n_anomalous_code_rows": int(df["anomalous_code_flag"].sum()) if "anomalous_code_flag" in df.columns else 0,
     }
     return df, stats
 
@@ -413,12 +449,24 @@ def _flag_quarterly(df, plan_year, plan_col):
     otherwise "minor". Rows missing the annual value or any quarter, and rows
     with a non-positive annual plan, are skipped — never flagged. Sheets whose
     form has no quarterly breakdown at all keep every flag False (a structural
-    gap, same treatment as a missing prior-year baseline)."""
+    gap, same treatment as a missing prior-year baseline).
+
+    Some subsidiaries report quarters нарастающим итогом (cumulative -- Q4
+    already IS the annual total, Q3 already includes Q1+Q2, etc.) rather than
+    discrete per-quarter amounts. Summing four cumulative quarters against the
+    annual figure double/triple/quadruple-counts and flags every single row
+    "critical" — a 100% false positive on files using that convention. A row
+    is treated as cumulative when Q4 is within ~1% of the annual total AND
+    Q1<=Q2<=Q3<=Q4 (non-decreasing — a flat quarter with zero activity is
+    still a valid cumulative series, so this doesn't require strict growth);
+    in that case Q4 is compared directly to the annual figure instead of the
+    four-quarter sum. Otherwise the existing discrete sum-and-compare holds."""
     df["quarterly_sum"] = pd.NA
     df["quarterly_gap_abs"] = pd.NA
     df["quarterly_gap_pct"] = pd.NA
     df["quarterly_severity"] = pd.NA
     df["quarterly_mismatch_flag"] = False
+    df["quarterly_cumulative_detected"] = False
 
     quarter_cols = [f"plan_{plan_year}_q{n}" for n in range(1, 5)] if plan_year else []
     if not quarter_cols or plan_col not in df.columns \
@@ -428,13 +476,21 @@ def _flag_quarterly(df, plan_year, plan_col):
     annual = pd.to_numeric(df[plan_col], errors="coerce")
     quarters = df[quarter_cols].apply(pd.to_numeric, errors="coerce")
     complete = annual.notna() & quarters.notna().all(axis=1) & (annual > 0)
-    qsum = quarters.sum(axis=1)
-    gap = annual - qsum
+    q1, q2, q3, q4 = (quarters[c] for c in quarter_cols)
+
+    discrete_sum = quarters.sum(axis=1)
+    q4_gap_pct = (annual - q4).abs() / annual.replace(0, pd.NA) * 100
+    monotonic = (q1 <= q2) & (q2 <= q3) & (q3 <= q4)
+    is_cumulative = complete & monotonic & (q4_gap_pct <= 1.0)
+
+    effective_sum = discrete_sum.where(~is_cumulative, q4)
+    gap = annual - effective_sum
     gap_pct = gap.abs() / annual * 100
 
-    df.loc[complete, "quarterly_sum"] = qsum[complete]
+    df.loc[complete, "quarterly_sum"] = effective_sum[complete]
     df.loc[complete, "quarterly_gap_abs"] = gap[complete]
     df.loc[complete, "quarterly_gap_pct"] = gap_pct[complete]
+    df.loc[complete, "quarterly_cumulative_detected"] = is_cumulative[complete]
     flagged = complete & (gap_pct > 1.0)
     df.loc[flagged, "quarterly_severity"] = gap_pct[flagged].map(
         lambda pct: "critical" if pct > 5 else "minor"

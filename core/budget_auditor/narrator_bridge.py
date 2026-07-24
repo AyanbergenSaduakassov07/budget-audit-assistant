@@ -34,10 +34,26 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# A counterparty cell holding more than one legal-entity marker (e.g.
+# "ТОО Альфа, АО Бета") names multiple suppliers in one row, not one
+# compound-named supplier -- grouping on the raw string would attribute the
+# combined amount to a single "supplier" that doesn't exist, inflating (or
+# fabricating) concentration risk. \b works on Cyrillic here since Python's
+# re treats Cyrillic letters as word characters under the default UNICODE flag.
+_LEGAL_MARKER_RE = re.compile(r"\b(?:ТОО|АО|ИП|ЧП)\b")
+_COMPOUND_COUNTERPARTY_LABEL = "несколько контрагентов в одной строке"
+
+
+def _is_compound_counterparty(name) -> bool:
+    if name is None:
+        return False
+    return len(_LEGAL_MARKER_RE.findall(str(name))) > 1
 
 
 def _bool_col(df: pd.DataFrame, name: str) -> pd.Series:
@@ -171,7 +187,15 @@ def build_audit_result(meta: dict, combined: pd.DataFrame) -> dict:
 
 def _concentration(combined: pd.DataFrame, plan: pd.Series) -> dict:
     """Top-counterparty share of the campaign-year plan — names and percentages
-    only, mirroring budget_audit.concentration_risk's output keys."""
+    only, mirroring budget_audit.concentration_risk's output keys.
+
+    A counterparty cell with more than one legal-entity marker (multiple
+    suppliers typed into one row) is grouped separately under
+    _COMPOUND_COUNTERPARTY_LABEL and can never win top_supplier or set
+    concentration_flag — it doesn't represent a real single supplier, so
+    attributing its (possibly large) combined share to "one supplier" would
+    be a fabricated risk finding. It still appears in supplier_breakdown for
+    visibility."""
     empty = {"top_supplier": "", "top_supplier_pct": 0.0, "concentration_flag": False,
              "supplier_breakdown": pd.DataFrame(columns=["counterparty", "total_amount", "share_pct"])}
     if "counterparty" not in combined.columns:
@@ -182,17 +206,26 @@ def _concentration(combined: pd.DataFrame, plan: pd.Series) -> dict:
     named = combined["counterparty"].notna() & (combined["counterparty"].astype(str).str.strip() != "")
     if not named.any():
         return empty
-    amounts = plan[named].groupby(combined.loc[named, "counterparty"]).sum()
+
+    counterparty = combined["counterparty"].astype(str)
+    is_compound = counterparty.apply(_is_compound_counterparty)
+    group_key = counterparty.where(~is_compound, _COMPOUND_COUNTERPARTY_LABEL)
+
+    amounts = plan[named].groupby(group_key[named]).sum()
     top = (amounts / total * 100).sort_values(ascending=False)
     breakdown = pd.DataFrame({
         "counterparty": top.index,
         "total_amount": amounts.reindex(top.index).values,
         "share_pct": top.values,
     })
+
+    real = breakdown[breakdown["counterparty"] != _COMPOUND_COUNTERPARTY_LABEL]
+    if real.empty:
+        return {**empty, "supplier_breakdown": breakdown}
     return {
-        "top_supplier": str(top.index[0]),
-        "top_supplier_pct": float(top.iloc[0]),
-        "concentration_flag": bool((top > 40).any()),
+        "top_supplier": str(real.iloc[0]["counterparty"]),
+        "top_supplier_pct": float(real.iloc[0]["share_pct"]),
+        "concentration_flag": bool((real["share_pct"] > 40).any()),
         "supplier_breakdown": breakdown,
     }
 
