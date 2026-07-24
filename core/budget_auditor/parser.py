@@ -78,13 +78,23 @@ COLUMN_SIGNATURES = {
 # source files.
 _CODE_RE = re.compile(r"^[A-Z]{2,4}-[A-Z]{2}-\d{2}$")
 
-# Footer/grand-total marker. A footer row can put this word in ANY column --
-# a real file was seen with the totals in a row whose CATEGORY column (not
-# the code column) read "Результат", one row above an "Общий результат"
-# label with no numbers. Checking only the code column let that totals row
-# slip through as an ordinary leaf line item before the label row (one row
-# later) finally triggered the break -- silently double-counting the total.
-_FOOTER_RE = re.compile(r"итог|результат")
+# Sheet-terminating footer marker. Confirmed against 4 real files: the ONE
+# reliable one-time sheet-ending label is "Общий результат" in the Статья
+# бюджета (code) column -- checked here ONLY, as a substring search, and
+# ONLY against that column. An earlier version searched this same pattern
+# across every column (including free-text description/justification), which
+# false-positived on ordinary prose like "результатов инвентаризации
+# оборудования" in a justification sentence and truncated the sheet after
+# 1-2 rows -- never search this against free-text columns again.
+_SHEET_END_RE = re.compile(r"итог|результат")
+
+# A bare per-budget-code subtotal row: category/subcategory holds EXACTLY
+# (full match, not substring) "результат" or "итого" after normalizing
+# whitespace/case. Real files repeat this after EVERY budget-code section
+# (IT-OP-01, IT-OP-02, IT-OP-03, ...) -- it is a single-row skip, not a
+# sheet-ending marker, and (being a full-match check) never fires on free
+# text that merely contains "результат" as a substring.
+_SECTION_SUBTOTAL_LABELS = frozenset({"результат", "итого"})
 
 
 def _norm(s):
@@ -99,13 +109,20 @@ def _is_valid_budget_code(code) -> bool:
     return bool(_CODE_RE.match(str(code).strip()))
 
 
-def _is_footer_row(ws, row, max_col) -> bool:
-    """True if ANY column in this row carries a footer/grand-total marker."""
-    for c in range(1, max_col + 1):
-        v = ws.cell(row=row, column=c).value
-        if v and _FOOTER_RE.search(_norm(v)):
-            return True
-    return False
+def _is_sheet_end_row(ws, row) -> bool:
+    """True if the Статья бюджета (code) column carries the sheet's one-time
+    ending label (e.g. "Общий результат"). Checked ONLY against this column
+    -- see _SHEET_END_RE."""
+    v = ws.cell(row=row, column=3).value
+    return bool(v and _SHEET_END_RE.search(_norm(v)))
+
+
+def _is_section_subtotal_row(category, subcat) -> bool:
+    """True if category or subcategory is EXACTLY "результат"/"итого" -- a
+    per-budget-code subtotal that repeats after every section. Excluded from
+    leaf ingestion, but never terminates the sheet -- see
+    _SECTION_SUBTOTAL_LABELS."""
+    return _norm(category) in _SECTION_SUBTOTAL_LABELS or _norm(subcat) in _SECTION_SUBTOTAL_LABELS
 
 
 def read_metadata(ws):
@@ -197,12 +214,12 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
     n_blank = n_category = n_leaf = 0
 
     for r in range(header_row + 1, ws.max_row + 1):
-        # Every form ends with a grand-total block. The footer marker can land
-        # in ANY column of the row (not just the code column -- see
-        # _is_footer_row), so this must be checked before anything else, or a
-        # totals row with the marker in e.g. the category column gets ingested
-        # as an ordinary leaf line item and silently doubles the total.
-        if _is_footer_row(ws, r, max_col):
+        # Every form ends with a grand-total block, e.g. "Общий результат" in
+        # the code column -- the one true one-time sheet-ending label
+        # confirmed across every real file examined. Checked ONLY against
+        # the code column (never free text) so this can't false-positive on
+        # ordinary prose elsewhere in the row -- see _is_sheet_end_row.
+        if _is_sheet_end_row(ws, r):
             break
 
         code = ws.cell(row=r, column=3).value
@@ -213,6 +230,13 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
 
         if code:
             cur_code, cur_code_name = code, code_name
+            continue
+
+        # A bare per-section subtotal ("Результат"/"Итого" alone in category
+        # or subcategory) repeats after every budget-code section in real
+        # files -- exclude just this row, keep reading the sections after it.
+        if _is_section_subtotal_row(category, subcat):
+            n_blank += 1
             continue
 
         is_leaf = isinstance(plan_val, (int, float)) and bool(category or subcat)

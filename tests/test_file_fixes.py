@@ -62,9 +62,9 @@ def test_anomalous_code_flag_marks_non_conforming_codes(tmp_path):
 
 # --- 2. footer marker outside the code column -------------------------------------
 def _footer_marker_in_category_column_workbook(path):
-    """Real file shape: totals land in a row whose CATEGORY column (not the
-    code column) reads "Результат", one row above an "Общий результат" label
-    row with no numbers at all."""
+    """Real file shape: a per-section subtotal row whose CATEGORY column
+    (not the code column) reads bare "Результат", one row above the true
+    "Общий результат" sheet-ending label in the code column."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "OPEX"
@@ -87,13 +87,15 @@ def _footer_marker_in_category_column_workbook(path):
     return path
 
 
-def test_footer_row_excluded_even_when_marker_outside_code_column(tmp_path):
+def test_section_subtotal_row_excluded_without_terminating_sheet(tmp_path):
     path = _footer_marker_in_category_column_workbook(tmp_path / "footer.xlsx")
     _, sheets = parse_workbook(path)
     df = sheets["OPEX"]["df"]
 
-    # Before the fix: the "Результат" row (category col, not code col) slipped
-    # through as a leaf line item -- 5000 + 2000 + 7000 (phantom) = 14000.
+    # A bare "Результат" in the category column is a per-section subtotal --
+    # excluded (not a phantom leaf: 5000 + 2000 + 7000 would be 14000), but
+    # it must not terminate the sheet either; only the code-column "Общий
+    # результат" label one row below does that.
     assert len(df) == 2
     assert pd.to_numeric(df["plan_2026"], errors="coerce").sum() == 7000
 
@@ -222,3 +224,114 @@ def test_budget_audit_concentration_risk_excludes_compound_counterparty():
     assert result["top_supplier"] == "ТОО Альфа"
     assert result["concentration_flag"] is False
     assert "несколько контрагентов в одной строке" in result["supplier_breakdown"]["counterparty"].tolist()
+
+
+# --- 5. footer-detection regression: free text vs. section subtotal vs. true end ---
+# The all-columns footer scan added to fix issue 2 above was itself a regression,
+# confirmed against 4 real ACM files:
+#   (a) the "итог|результат" search matched free-text justification/description
+#       prose ("результатов инвентаризации оборудования") and truncated the
+#       sheet after 1-2 rows;
+#   (b) real forms repeat a bare "Результат" category-column subtotal after
+#       EVERY budget-code section (not just once at the sheet's true end) --
+#       treating the first occurrence as a sheet-ending break discarded every
+#       section after the first;
+#   (c) the one true one-time ending label is "Общий результат" specifically
+#       in the Статья бюджета (code) column.
+# Fix: the sheet-terminating check is code-column-only again; a bare
+# "результат"/"итого" in category/subcategory is a non-terminating per-row
+# skip; the footer pattern is never applied to free-text columns.
+def _justification_false_positive_workbook(path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OPEX"
+    _write_meta(ws, campaign_year=2026)
+    hdr = 9
+    _write_headers(ws, hdr, {9: "Контрагент", 10: "Обоснование", 11: "План за 2026 год"})
+    r = hdr + 1
+    ws.cell(row=r, column=3, value="IT-OP-01"); ws.cell(row=r, column=4, value="Оборудование")
+    r += 1
+    ws.cell(row=r, column=7, value="Оборудование"); ws.cell(row=r, column=8, value="Мониторы")
+    ws.cell(row=r, column=9, value="Dell")
+    ws.cell(row=r, column=10, value=(
+        "Потребность определена на основании заявок подразделений, "
+        "результатов инвентаризации оборудования и производственной необходимости."
+    ))
+    ws.cell(row=r, column=11, value=4000)
+    r += 1  # a second leaf row that must NOT be truncated away by the false positive
+    ws.cell(row=r, column=7, value="Оборудование"); ws.cell(row=r, column=8, value="Клавиатуры")
+    ws.cell(row=r, column=9, value="Dell"); ws.cell(row=r, column=11, value=1000)
+    ws.cell(row=r + 1, column=3, value="Общий результат"); ws.cell(row=r + 1, column=11, value=5000)
+    wb.save(path)
+    return path
+
+
+def test_justification_substring_does_not_truncate_sheet(tmp_path):
+    path = _justification_false_positive_workbook(tmp_path / "justification.xlsx")
+    _, sheets = parse_workbook(path)
+    df = sheets["OPEX"]["df"]
+
+    assert len(df) == 2  # both leaf rows survive, not just the first
+    assert pd.to_numeric(df["plan_2026"], errors="coerce").sum() == 5000
+
+
+def _multi_section_subtotal_workbook(path):
+    """Three budget-code sections, each ending in a bare "Результат"
+    category-column subtotal -- the real sample.xlsx pattern (IT-OP-01,
+    IT-OP-02, IT-OP-03, ... each followed by its own "Результат" row)."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OPEX"
+    _write_meta(ws, campaign_year=2026)
+    hdr = 9
+    _write_headers(ws, hdr, {9: "Контрагент", 11: "План за 2026 год"})
+    r = hdr + 1
+    for i, (code, name, item, amount) in enumerate([
+        ("IT-OP-01", "Связь", "Интернет", 1000),
+        ("IT-OP-02", "Лицензии", "Антивирус", 2000),
+        ("IT-OP-03", "Обслуживание", "Поддержка", 3000),
+    ], start=1):
+        ws.cell(row=r, column=3, value=code); ws.cell(row=r, column=4, value=name)
+        r += 1
+        ws.cell(row=r, column=7, value=name); ws.cell(row=r, column=8, value=item)
+        ws.cell(row=r, column=9, value="Вендор"); ws.cell(row=r, column=11, value=amount)
+        r += 1  # per-section subtotal: must be skipped, must NOT end the sheet
+        ws.cell(row=r, column=7, value="Результат"); ws.cell(row=r, column=11, value=amount)
+        r += 1
+    ws.cell(row=r, column=3, value="Общий результат"); ws.cell(row=r, column=11, value=6000)
+    wb.save(path)
+    return path
+
+
+def test_multiple_section_subtotals_do_not_truncate_later_sections(tmp_path):
+    path = _multi_section_subtotal_workbook(tmp_path / "multi_section.xlsx")
+    _, sheets = parse_workbook(path)
+    df = sheets["OPEX"]["df"]
+
+    # Before the fix: the FIRST "Результат" row (after IT-OP-01) ended the
+    # sheet, discarding IT-OP-02 and IT-OP-03 entirely.
+    assert set(df["statya_code"]) == {"IT-OP-01", "IT-OP-02", "IT-OP-03"}
+    assert len(df) == 3
+    assert pd.to_numeric(df["plan_2026"], errors="coerce").sum() == 6000
+
+
+def test_genuine_sheet_end_label_still_stops_parsing(tmp_path):
+    """A real "Общий результат" in the code column must still terminate the
+    sheet -- nothing after it (even a stray numeric row) is ingested."""
+    path = _multi_section_subtotal_workbook(tmp_path / "sheet_end.xlsx")
+    wb = openpyxl.load_workbook(path)
+    ws = wb["OPEX"]
+    end_row = next(
+        r for r in range(1, ws.max_row + 1)
+        if ws.cell(row=r, column=3).value == "Общий результат"
+    )
+    # A stray row below the true end label, shaped like a leaf row.
+    ws.cell(row=end_row + 1, column=7, value="Прочее")
+    ws.cell(row=end_row + 1, column=8, value="Не должно попасть")
+    ws.cell(row=end_row + 1, column=11, value=99_999)
+    wb.save(path)
+
+    _, sheets = parse_workbook(path)
+    df = sheets["OPEX"]["df"]
+    assert "Не должно попасть" not in df["item_name"].tolist()
+    assert pd.to_numeric(df["plan_2026"], errors="coerce").sum() == 6000
