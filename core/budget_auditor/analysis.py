@@ -221,6 +221,106 @@ def _multi_year_capex_opex_answer(combined_df, unit, multi_year):
     return "\n".join(lines)
 
 
+# --- shared keyword-matching helpers used by both answer_query() and chat_answer() --
+
+# Bug C: "без обоснован"/"нет обоснован" was too narrow -- an exact adjacent
+# phrase -- to catch real phrasings like "не имеют обоснования" or
+# "обоснование отсутствует". Broadened to: the question mentions the topic
+# ('обоснован') AND any negation word appears anywhere in the question.
+_JUSTIFICATION_NEGATIONS = ("без", "нет", "не имеют", "отсутств", "не заполнен")
+
+
+def _mentions_missing_justification(q):
+    return "обоснован" in q and any(neg in q for neg in _JUSTIFICATION_NEGATIONS)
+
+
+# Bug E: the "топ"/"самых"/"риск" ranking branches hardcoded nlargest(5).
+# Parse an optional requested count adjacent to "топ"/"самых" ("топ-3",
+# "топ 10", "3 самых"), capped at _MAX_TOP_N regardless of what's requested.
+_TOP_N_RE = re.compile(r"топ[\s-]*(\d+)|(\d+)\s*(?:самых|топ)")
+_MAX_TOP_N = 20
+
+
+def _requested_top_n(q, default=5):
+    m = _TOP_N_RE.search(q)
+    if not m:
+        return default
+    n = int(m.group(1) or m.group(2))
+    return max(1, min(n, _MAX_TOP_N))
+
+
+# Bug #4 (routing): chat_answer()'s branches match on bare substrings with no
+# check that the matched branch actually covers the WHOLE question. A
+# question combining trigger words from more than one branch (a named-branch
+# capex/opex comparison, two distinct years used as separate single-year
+# asks rather than a range, a year + missing-justification clause, or an
+# explicit conjunction joining two different keyword groups) gets a
+# confident, wrong, PARTIAL answer from whichever branch's `if` fires
+# first -- and the caller's smarter file_sql fallback (the only tier that can
+# run a real multi-condition query) never runs, because the rule engine only
+# returns None on a total miss, not a partial one. _looks_compound() bails
+# out early instead, so chat_answer() returns None and app.py's existing
+# fallback chain (chat_answer -> answer_over_file -> FALLBACK_REPLY) routes
+# the question to the SQL/decomposition engine.
+_RANKING_TOKENS = ("самые дорог", "самые крупн", "топ", "риск")
+_COMPARISON_TOKENS = ("сравни", "сравнение")
+_CAPEX_OPEX_TOKENS = ("capex", "капекс", "капвлож", "opex", "опекс", "операционн")
+_BRANCH_GROUP_TOKENS = ("ветк", "филиал", "по дочк", "какая дочк", "branch")
+_COMPOUND_CONJUNCTIONS = (" и ", "а также", "при этом")
+
+
+def _mentioned_branch_names(q, combined_df):
+    """Distinct actual branch values from THIS file's data that literally
+    appear in the question -- e.g. 'го' and 'аф' in 'сравни capex го и аф'."""
+    if combined_df is None or "branch" not in combined_df.columns:
+        return set()
+    found = set()
+    for name in combined_df["branch"].dropna().astype(str).unique():
+        name_l = name.lower().strip()
+        if name_l and re.search(rf"(?<![а-яa-zё0-9]){re.escape(name_l)}(?![а-яa-zё0-9])", q):
+            found.add(name_l)
+    return found
+
+
+def _looks_compound(q, combined_df):
+    """True if `q` combines signals from more than one chat_answer() branch,
+    so the caller should bail out to None (routing to the SQL/decomposition
+    fallback) instead of letting whichever branch matches first answer only
+    part of the question."""
+    years = set(re.findall(r"20\d{2}", q))
+    # An explicit "с 2026 до 2027" range or a general "по всем годам"/"за все
+    # года" marker legitimately mentions 2+ years -- that's the multi-year
+    # breakdown branch's job, not a compound question.
+    multi_year = _detect_multi_year_request(q)
+    if len(years) > 1 and not multi_year:
+        return True
+
+    has_justification = "обоснован" in q
+    has_ranking = any(t in q for t in _RANKING_TOKENS)
+    has_comparison = any(t in q for t in _COMPARISON_TOKENS)
+    has_capex_opex = any(t in q for t in _CAPEX_OPEX_TOKENS)
+    has_branch_group = any(t in q for t in _BRANCH_GROUP_TOKENS)
+    branch_names = _mentioned_branch_names(q, combined_df)
+
+    if years and has_justification:
+        return True
+    if has_comparison and has_ranking:
+        return True
+    # "сравни CAPEX ГО и АФ": naming 2+ specific branches alongside a
+    # cost-type keyword means "compare these branches", not the whole-
+    # company OPEX/CAPEX split the plain comparison branch answers.
+    if has_capex_opex and len(branch_names) >= 2:
+        return True
+    if has_comparison and has_capex_opex and has_branch_group:
+        return True
+
+    matched_groups = sum([has_capex_opex, has_branch_group, has_justification, has_ranking])
+    if matched_groups >= 2 and any(c in q for c in _COMPOUND_CONJUNCTIONS):
+        return True
+
+    return False
+
+
 def answer_query(question, df, stats, meta):
     """Deterministic keyword/year/regex based Q&A over one parsed sheet.
     Covers: 'бюджет на <year>', 'сколько потратили на <keyword>',
@@ -236,8 +336,9 @@ def answer_query(question, df, stats, meta):
 
     year_match = re.search(r"(20\d{2})", q)
     year = int(year_match.group(1)) if year_match else None
+    year_col = _resolve_year_col(df, year)
 
-    if any(w in q for w in ["без обоснован", "нет обоснован", "отсутств"]) and "обоснован" in q:
+    if _mentions_missing_justification(q):
         if not stats["has_justification"]:
             return "В форме нет колонки «Обоснование» вообще -- обоснование отсутствует для 100% статей."
         missing = df[df["missing_justification_flag"]]
@@ -250,20 +351,19 @@ def answer_query(question, df, stats, meta):
         plan_col = f"plan_{stats['plan_year']}"
         if plan_col not in df.columns:
             return "Нет данных плана для ранжирования."
-        top = df.nlargest(5, plan_col)[["item_name", plan_col]]
+        n = _requested_top_n(q)
+        top = df.nlargest(n, plan_col)[["item_name", plan_col]]
         lines = [f"{r.item_name}: {format_money(getattr(r, plan_col), unit)}" for r in top.itertuples()]
-        return "Топ-5 самых крупных статей:\n" + "\n".join(lines)
+        return f"Топ-{n} самых крупных статей:\n" + "\n".join(lines)
 
     if any(w in q for w in ["сколько статей", "количество статей", "число статей"]):
         return f"Заполненных статей расхода: {len(df)}."
 
-    year_col = _resolve_year_col(df, year)
-    if year_col:
-        total = pd.to_numeric(df[year_col], errors="coerce").sum()
-        label = _YEAR_VALUE_LABELS[year_col.split("_", 1)[0]]
-        return f"{label} на {year} год: {format_money(total, unit)}."
-
     # keyword search across item_name / category / subcategory / counterparty
+    # -- tried BEFORE the plain year-total branch below (Bug B): a question
+    # naming both a year AND some other filter (counterparty/category/item
+    # keyword) must be answered by that filter, not silently fall back to the
+    # whole year's total just because a year was also mentioned.
     tokens = [t for t in re.split(r"[^а-яa-zё0-9]+", q) if len(t) > 3]
     if tokens:
         mask = pd.Series(False, index=df.index)
@@ -273,14 +373,21 @@ def answer_query(question, df, stats, meta):
                     mask |= df[col].astype(str).str.lower().str.contains(t, na=False)
         matched = df[mask]
         if not matched.empty:
-            plan_col = f"plan_{stats['plan_year']}"
-            total = pd.to_numeric(matched[plan_col], errors="coerce").sum() if plan_col in matched.columns else None
+            col = year_col or f"plan_{stats['plan_year']}"
+            total = pd.to_numeric(matched[col], errors="coerce").sum() if col in matched.columns else None
             names = ", ".join(matched["item_name"].astype(str).head(5))
             return (
                 f"Найдено {len(matched)} совпадающих статей ({names}"
                 f"{'...' if len(matched) > 5 else ''}). "
                 f"Суммарный план: {format_money(total, unit)}."
             )
+
+    # Only use the plain year-total branch when the token search above found
+    # nothing to filter on.
+    if year_col:
+        total = pd.to_numeric(df[year_col], errors="coerce").sum()
+        label = _YEAR_VALUE_LABELS[year_col.split("_", 1)[0]]
+        return f"{label} на {year} год: {format_money(total, unit)}."
 
     return None  # no rule matched -- plug in an LLM fallback here
 
@@ -305,6 +412,9 @@ def chat_answer(question, combined_df, meta):
         return "В файле нет заполненных данных для анализа."
 
     q = question.lower().strip()
+    if _looks_compound(q, combined_df):
+        return None
+
     unit = meta.get("unit", "")
     plan_year = combined_df["plan_year"].dropna().iloc[0] if combined_df["plan_year"].notna().any() else None
     plan_col = f"plan_{plan_year}" if plan_year else None
@@ -353,7 +463,7 @@ def chat_answer(question, combined_df, meta):
         lines = [f"{b}: {format_money(v, unit)}" for b, v in g.items()]
         return "По подразделениям:\n" + "\n".join(lines)
 
-    if any(w in q for w in ["без обоснован", "нет обоснован"]) and "обоснован" in q:
+    if _mentions_missing_justification(q):
         if "missing_justification_flag" not in combined_df.columns:
             return "Обоснование не проверялось для этого файла."
         missing = combined_df[combined_df["missing_justification_flag"] == True]  # noqa: E712
@@ -364,11 +474,34 @@ def chat_answer(question, combined_df, meta):
         return f"Всего без обоснования: {len(missing)} статей.\n" + "\n".join(lines)
 
     if any(w in q for w in ["самые дорог", "самые крупн", "топ", "риск"]):
+        n = _requested_top_n(q)
         col = year_col or plan_col
-        top = combined_df.nlargest(5, col)[["item_name", "cost_type", "branch", col]]
+        top = combined_df.nlargest(n, col)[["item_name", "cost_type", "branch", col]]
         lines = [f"{r.item_name} ({r.cost_type}, {r.branch}): {format_money(getattr(r, col), unit)}" for r in top.itertuples()]
-        return "Топ-5 самых крупных статей по всему файлу:\n" + "\n".join(lines)
+        return f"Топ-{n} самых крупных статей по всему файлу:\n" + "\n".join(lines)
 
+    # keyword search across item_name / category / subcategory / counterparty
+    # -- tried BEFORE the plain year-total branch below (Bug B): a question
+    # naming both a year AND some other filter (counterparty/category/item
+    # keyword) must be answered by that filter, not silently fall back to the
+    # whole-file year total just because a year was also mentioned.
+    tokens = [t for t in re.split(r"[^а-яa-zё0-9]+", q) if len(t) > 3]
+    if tokens:
+        mask = pd.Series(False, index=combined_df.index)
+        for col in ["item_name", "category", "subcategory", "counterparty"]:
+            if col in combined_df.columns:
+                for t in tokens:
+                    mask |= combined_df[col].astype(str).str.lower().str.contains(t, na=False)
+        matched = combined_df[mask]
+        if not matched.empty:
+            col = year_col or plan_col
+            total = pd.to_numeric(matched[col], errors="coerce").sum() if col in matched.columns else None
+            names = ", ".join(matched["item_name"].astype(str).head(5))
+            return (f"Найдено {len(matched)} статей по всему файлу ({names}"
+                    f"{'...' if len(matched) > 5 else ''}). Суммарно: {format_money(total, unit)}.")
+
+    # Only use the plain year-total branch when the token search above found
+    # nothing to filter on.
     if year and year_col:
         total = pd.to_numeric(combined_df[year_col], errors="coerce").sum()
         label = _YEAR_VALUE_LABELS[year_col.split("_", 1)[0]]
@@ -405,20 +538,5 @@ def chat_answer(question, combined_df, meta):
             return "В этом файле нет годовых колонок (план/факт/прогноз) для сравнения по годам."
         lines = [f"{r.Год} — {r.Тип}: {format_money(r.Сумма, unit)}" for r in yt.itertuples()]
         return "Годы, представленные в файле:\n" + "\n".join(lines)
-
-    tokens = [t for t in re.split(r"[^а-яa-zё0-9]+", q) if len(t) > 3]
-    if tokens:
-        mask = pd.Series(False, index=combined_df.index)
-        for col in ["item_name", "category", "subcategory", "counterparty"]:
-            if col in combined_df.columns:
-                for t in tokens:
-                    mask |= combined_df[col].astype(str).str.lower().str.contains(t, na=False)
-        matched = combined_df[mask]
-        if not matched.empty:
-            col = year_col or plan_col
-            total = pd.to_numeric(matched[col], errors="coerce").sum() if col in matched.columns else None
-            names = ", ".join(matched["item_name"].astype(str).head(5))
-            return (f"Найдено {len(matched)} статей по всему файлу ({names}"
-                    f"{'...' if len(matched) > 5 else ''}). Суммарно: {format_money(total, unit)}.")
 
     return None

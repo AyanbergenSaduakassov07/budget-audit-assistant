@@ -193,6 +193,94 @@ def test_chat_answers_span_whole_file(full_form):
         assert reply and fragment in reply, (question, reply)
 
 
+# --- routing fixes: bug B (year shadows other filters), bug C (narrow
+# justification phrasing), bug E (hardcoded top-5), bug #4 (compound bailout) --
+def test_chat_answer_plain_year_total_still_works(full_form):
+    """Non-regression for the Bug B reordering: a simple year-only question
+    with no other filter to match on must still get the plain whole-file
+    year total, not be swallowed by the token-search branch now checked
+    first."""
+    meta, _, _, combined = full_form
+    reply = chat_answer("сколько всего потратили в 2026 году", combined, meta)
+    assert reply is not None
+    assert "17 000" in reply
+    assert "все подразделения" in reply
+
+
+def test_chat_answer_token_filter_wins_over_year_total(full_form):
+    """Bug B: a question naming BOTH a year AND another filter (a
+    counterparty here) must be answered by that filter, not the whole
+    file's year total, just because a year was also mentioned. Before the
+    fix, this returned the whole-file 17 000 total for 2026, silently
+    ignoring "Телеком Плюс"."""
+    meta, _, _, combined = full_form
+    reply = chat_answer("сколько потратили на Телеком Плюс в 2026 году", combined, meta)
+    assert reply is not None
+    assert "7 200" in reply       # Сотовая связь (2000) + Интернет (5200)
+    assert "17 000" not in reply  # NOT the whole-file 2026 total
+
+
+def test_chat_answer_broadened_justification_phrasing(full_form):
+    """Bug C: "не имеют обоснования" (not just the old narrow "без обоснован"/
+    "нет обоснован" substrings) must also match the justification branch."""
+    meta, _, _, combined = full_form
+    reply = chat_answer("какие статьи не имеют обоснования", combined, meta)
+    assert reply is not None
+    assert "Всего без обоснования: 3" in reply
+
+
+def test_chat_answer_top_n_parsed_from_question(full_form):
+    """Bug E: "топ-3" must return exactly 3 rows, not the hardcoded 5."""
+    meta, _, _, combined = full_form
+    reply = chat_answer("топ-3 самых крупных", combined, meta)
+    assert reply is not None
+    assert reply.startswith("Топ-3 самых крупных статей по всему файлу:")
+    assert len(reply.splitlines()) == 4  # header + exactly 3 rows
+    assert "СХД" not in reply  # the 4th/lowest-value row, correctly excluded
+
+
+def test_answer_query_broadened_justification_check(full_form):
+    """Bug C, answer_query() side: same broadened phrasing check."""
+    meta, _, flagged, _ = full_form
+    df, stats = flagged["OPEX"]["df"], flagged["OPEX"]["stats"]
+    reply = answer_query("какие статьи не имеют обоснования", df, stats, meta)
+    assert reply is not None
+    assert reply.startswith("1 статей без обоснования")
+    assert "Интернет" in reply
+
+
+def test_answer_query_top_n_parses_requested_count(full_form):
+    """Bug E, answer_query() side: requested count honored, not hardcoded 5."""
+    meta, _, flagged, _ = full_form
+    df, stats = flagged["ГО CAPEX"]["df"], flagged["ГО CAPEX"]["stats"]
+    reply = answer_query("топ-1 самых крупных", df, stats, meta)
+    assert reply is not None
+    assert reply.startswith("Топ-1 самых крупных статей:")
+    assert len(reply.splitlines()) == 2  # header + exactly 1 row
+
+
+def test_chat_answer_compound_bailout_prevents_partial_branch_comparison():
+    """Bug #4: "сравни CAPEX ГО и АФ" names two specific branches alongside a
+    cost-type keyword -- that means "compare these two branches" (a real
+    multi-condition query only file_sql can do), not the whole-company
+    OPEX/CAPEX split the plain comparison branch answers. chat_answer() must
+    return None so app.py's file_sql fallback handles it instead of a
+    confident, wrong, company-wide ratio."""
+    combined = pd.DataFrame({
+        "branch": ["ГО", "АФ"],
+        "cost_type": ["CAPEX", "CAPEX"],
+        "item_name": ["Сервер", "Сервер2"],
+        "category": ["Оборудование", "Оборудование"],
+        "subcategory": [None, None],
+        "counterparty": ["Dell", "HP"],
+        "plan_year": [2026, 2026],
+        "plan_2026": [1000, 2000],
+    })
+    meta = {"unit": 1000}
+    reply = chat_answer("сравни CAPEX ГО и АФ", combined, meta)
+    assert reply is None
+
+
 # --- multi-year OPEX/CAPEX breakdown ("...по всем годам" / "...за все года") ----
 def _multi_year_workbook(path):
     """OPEX + CAPEX sheets sharing campaign year 2027, each carrying three
