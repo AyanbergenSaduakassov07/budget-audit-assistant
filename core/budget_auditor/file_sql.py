@@ -41,7 +41,15 @@ from legacy.query_engine import (
     _generate_sql_with_error_feedback,
     _get_client,
     _phrase_answer,
+    classify_question,
+    decompose_question,
+    synthesize_answer,
 )
+
+# Compound questions are split into at most this many sub-questions, even if
+# the model's decomposition returns more — bounds both LLM call count and
+# temp-DB query count for a single answer_over_file() invocation.
+_MAX_SUBQUESTIONS = 4
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +195,78 @@ Money columns (REAL, суммы в {unit_label}):
 """
 
 
+def _generate_and_run_sql(
+    client,
+    question: str,
+    schema: str,
+    db_path: str,
+    history: list[tuple[str, str]] | None,
+) -> tuple[str, pd.DataFrame]:
+    """Generate SQL for `question` and execute it; on failure, retry once via
+    _generate_sql_with_error_feedback (see fix #2). Raises if both the first
+    attempt and the corrected retry fail to execute — callers decide the
+    fallback. Logs both SQLs at INFO whenever a retry happens, either way.
+
+    Shared by the simple single-question path and each sub-question of the
+    compound path, so the same one-retry discipline applies to both.
+    """
+    sql = _generate_sql(
+        client, question, schema, history=history,
+        examples=_BUDGET_ITEMS_SQL_EXAMPLES,
+    )
+    try:
+        df = warehouse.run_sql(sql, db_path)
+        return sql, df
+    except Exception as exc:
+        corrected_sql = _generate_sql_with_error_feedback(
+            client, question, schema, sql, str(exc), history=history,
+        )
+        try:
+            df = warehouse.run_sql(corrected_sql, db_path)
+        except Exception:
+            logger.info(
+                "file SQL retry also failed for question %r — "
+                "first attempt: %s | retry: %s",
+                question, sql, corrected_sql,
+            )
+            raise
+        logger.info(
+            "file SQL self-correction succeeded for question %r — "
+            "first attempt: %s | retry: %s",
+            question, sql, corrected_sql,
+        )
+        return corrected_sql, df
+
+
+def _answer_compound(
+    client,
+    question: str,
+    schema: str,
+    db_path: str,
+    history: list[tuple[str, str]] | None,
+) -> str | None:
+    """Decompose a compound question into sub-questions, answer each with the
+    single-question SQL path, and synthesize one final answer from all the
+    sub-results. Returns None if decomposition yields nothing usable. Any
+    exception (decomposition or a sub-query exhausting its retry) propagates
+    to the caller, which falls back to treating the question as simple.
+    """
+    sub_questions = decompose_question(client, question, schema, history=history)
+    sub_questions = sub_questions[:_MAX_SUBQUESTIONS]
+    if not sub_questions:
+        return None
+
+    logger.info("question %r decomposed into sub-questions: %s", question, sub_questions)
+
+    subresults: list[tuple[str, str, str]] = []
+    for sub_question in sub_questions:
+        sub_sql, sub_df = _generate_and_run_sql(client, sub_question, schema, db_path, history)
+        result_text = sub_df.to_string(index=False) if not sub_df.empty else "(пустой результат)"
+        subresults.append((sub_question, sub_sql, result_text))
+
+    return synthesize_answer(client, question, subresults, history=history) or None
+
+
 def answer_over_file(
     question: str,
     combined: pd.DataFrame,
@@ -202,11 +282,18 @@ def answer_over_file(
     legacy.query_engine._format_history). Text only, no raw data, so this
     doesn't touch the existing data-minimization boundary.
 
-    If the generated SQL fails to execute (bad column, syntax error), one
-    self-correction retry is attempted: the model is shown its own failed SQL
-    and the exact error via legacy.query_engine._generate_sql_with_error_feedback,
-    and asked for a single corrected query. If the retry also fails, this
-    still returns None as before — exactly one retry, not a loop.
+    A cheap classify_question() call decides the path:
+    - "simple": single SQL generation + execute, with the one-retry
+      self-correction from fix #2 (_generate_and_run_sql).
+    - "compound": decompose_question() splits the question into 2-4
+      self-contained sub-questions (capped at _MAX_SUBQUESTIONS even if the
+      model returns more), each is answered via the same single-question SQL
+      path, and synthesize_answer() combines all the sub-results into one
+      final answer.
+
+    Classification, decomposition, and the compound path as a whole never
+    abort the call: any failure there falls back to the simple single-SQL
+    path instead. Only if that also fails does this return None.
 
     Returns the Russian answer string, or None on ANY failure (missing key,
     quota, empty data, bad SQL even after the retry, no numeric columns) — the
@@ -226,35 +313,30 @@ def answer_over_file(
     try:
         db_path = _load_temp_db(combined, dims, money)
         schema = _schema_description(combined, meta or {}, dims, money)
-        sql = _generate_sql(
-            client, question, schema, history=history,
-            examples=_BUDGET_ITEMS_SQL_EXAMPLES,
-        )
 
+        classification = "simple"
         try:
-            df = warehouse.run_sql(sql, db_path)
-        except Exception as exc:
-            # Bounded self-correction: one retry, showing the model its own
-            # failed SQL and the exact error, before giving up to None.
-            corrected_sql = _generate_sql_with_error_feedback(
-                client, question, schema, sql, str(exc), history=history,
+            classification = classify_question(client, question, schema)
+        except Exception:
+            logger.info(
+                "question classification failed for %r — treating as simple",
+                question,
             )
+        logger.info("question %r classified as %s", question, classification)
+
+        if classification == "compound":
             try:
-                df = warehouse.run_sql(corrected_sql, db_path)
+                compound_answer = _answer_compound(client, question, schema, db_path, history)
             except Exception:
                 logger.info(
-                    "file SQL retry also failed for question %r — "
-                    "first attempt: %s | retry: %s",
-                    question, sql, corrected_sql,
+                    "compound path failed for %r — falling back to simple", question,
                 )
-                return None
-            logger.info(
-                "file SQL self-correction succeeded for question %r — "
-                "first attempt: %s | retry: %s",
-                question, sql, corrected_sql,
-            )
-            sql = corrected_sql
+                compound_answer = None
+            if compound_answer is not None:
+                return compound_answer
+            # Falls through to the simple path below.
 
+        sql, df = _generate_and_run_sql(client, question, schema, db_path, history)
         result_text = df.to_string(index=False) if not df.empty else "(пустой результат)"
         answer = _phrase_answer(client, question, sql, result_text, empty=df.empty, history=history)
         return answer or None

@@ -15,6 +15,9 @@ Per SPEC.md architecture rule: this module is pure — no streamlit imports.
 
 from __future__ import annotations
 
+import re
+from typing import Literal
+
 from legacy import warehouse
 from legacy.llm_providers import DailyQuotaExhausted, LLMProvider, get_provider
 
@@ -171,6 +174,113 @@ def _generate_sql_with_error_feedback(
     )
 
     return _strip_sql_fences(client.generate_sql(prompt))
+
+
+def classify_question(
+    client: LLMProvider,
+    question: str,
+    schema_description: str,
+) -> Literal["simple", "compound"]:
+    """Cheap classification: can `question` be answered by ONE aggregation/
+    filter query, or does it require combining results from more than one
+    independent query (e.g. an "и"/"или"/comparative clause spanning two
+    different aggregations that can't be expressed as a single GROUP BY)?
+
+    A single short client.generate_json() call — same retry/backoff and
+    DailyQuotaExhausted contract as every other provider call in this module.
+    Parsing defaults to "simple" unless the model's answer clearly says
+    "compound", so a garbled response degrades to the cheaper, safer path.
+    """
+    prompt = (
+        "Ты классифицируешь вопросы к базе данных закупок компании (SQLite). "
+        "Определи: можно ли ответить на вопрос ОДНИМ SQL-запросом с одной "
+        "агрегацией/фильтром (simple), или вопрос составной и требует "
+        "объединения результатов НЕСКОЛЬКИХ независимых запросов — например, "
+        "содержит 'и'/'или'/сравнение между двумя разными агрегациями или "
+        "категориями, которые нельзя выразить одним GROUP BY (compound).\n\n"
+        f"{schema_description}\n"
+        f"Вопрос: {question}\n\n"
+        "Ответь ОДНИМ словом, без пояснений: simple или compound."
+    )
+    raw = client.generate_json(prompt).strip().lower()
+    return "compound" if "compound" in raw else "simple"
+
+
+_NUMBERED_LINE_RE = re.compile(r"^\s*\d+[.\):]\s*(.+?)\s*$")
+
+
+def _parse_numbered_list(text: str) -> list[str]:
+    """Extract items from a "1. ...\\n2. ..." style plain-text list."""
+    items = []
+    for line in text.splitlines():
+        m = _NUMBERED_LINE_RE.match(line)
+        if m:
+            item = m.group(1).strip()
+            if item:
+                items.append(item)
+    return items
+
+
+def decompose_question(
+    client: LLMProvider,
+    question: str,
+    schema_description: str,
+    history: list[tuple[str, str]] | None = None,
+) -> list[str]:
+    """Split a compound Russian question into 2-4 self-contained sub-questions
+    whose answers, taken together, answer the original question.
+
+    Returns plain-text sub-questions only — no SQL yet; each is run through
+    the same single-question SQL-generation + execute path as a simple
+    question. Capping at 4 (even if the model returns more) is the caller's
+    responsibility (see core.budget_auditor.file_sql._answer_compound).
+    """
+    prompt = (
+        "Раздели составной вопрос на 2-4 самостоятельных подвопроса, каждый "
+        "из которых можно закрыть ОДНИМ SQL-запросом с одной агрегацией или "
+        "фильтром. Ответы на все подвопросы вместе должны полностью отвечать "
+        "на исходный вопрос.\n\n"
+        f"{schema_description}\n"
+        f"{_format_history(history)}"
+        f"Исходный вопрос: {question}\n\n"
+        "Выведи ТОЛЬКО пронумерованный список подвопросов на русском, без SQL "
+        "и без пояснений, например:\n"
+        "1. ...\n2. ..."
+    )
+    raw = _generate_content(client, prompt)
+    return _parse_numbered_list(raw)
+
+
+def synthesize_answer(
+    client: LLMProvider,
+    original_question: str,
+    subresults: list[tuple[str, str, str]],
+    history: list[tuple[str, str]] | None = None,
+) -> str:
+    """Combine (sub_question, sql, result_text) triples into one final
+    Russian answer to the original compound question.
+
+    Same anti-hallucination discipline as _phrase_answer: the model is told
+    to cite ONLY numbers that appear in the sub-results below.
+    """
+    blocks = "\n\n".join(
+        f"Подвопрос: {q}\nSQL: {sql}\nРезультат:\n{result_text}"
+        for q, sql, result_text in subresults
+    )
+    prompt = (
+        "Ты аналитик по закупкам компании. Ниже — исходный составной вопрос, "
+        "разбитый на подвопросы, и для каждого подвопроса — выполненный SQL и "
+        "результат его выполнения. Объедини их в один краткий ответ на "
+        "русском на исходный вопрос. Используй ТОЛЬКО числа из результатов "
+        "ниже — ничего не выдумывай. Суммы в тенге (KZT). "
+        + _NUMBER_FORMAT_INSTRUCTION
+        + "\n\n"
+        f"{_format_history(history)}"
+        f"Исходный вопрос: {original_question}\n\n"
+        f"{blocks}\n\n"
+        "Итоговый ответ:"
+    )
+    return _generate_content(client, prompt).strip()
 
 
 # SQL result frames can hold very large sums (e.g. workbook-wide totals in

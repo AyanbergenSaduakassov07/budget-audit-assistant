@@ -193,6 +193,132 @@ def test_retry_also_fails_returns_none_without_raising(tmp_path, monkeypatch, ca
     assert "SELECT SUM(still_bad_column) FROM budget_items" in caplog.text
 
 
+# --- compound-question classification / decomposition / synthesis --------------
+def test_classified_simple_takes_single_sql_path_unchanged(tmp_path, monkeypatch):
+    """A question the model classifies "simple" must take the existing
+    single-SQL-generation path: one generate_sql call, one generate_json call
+    for the classification, one more for _phrase_answer — no decomposition or
+    synthesis call is ever made."""
+    combined = _subsidiary_b(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+    json_prompts = []
+
+    class _FakeProvider:
+        def generate_sql(self, prompt):
+            return "SELECT SUM(plan_2027) AS total FROM budget_items"
+
+        def generate_json(self, prompt):
+            json_prompts.append(prompt)
+            if "simple или compound" in prompt:
+                return "simple"
+            return "Итог: план 2027 = 9 800."
+
+    monkeypatch.setattr(file_sql, "_get_client", lambda: _FakeProvider())
+
+    answer = answer_over_file("сколько всего плана на 2027 год", combined, {"unit": 1000})
+
+    assert answer == "Итог: план 2027 = 9 800."
+    assert len(json_prompts) == 2  # classify + phrase_answer only
+    assert not any("Раздели составной вопрос" in p for p in json_prompts)
+
+
+def test_compound_question_runs_subqueries_and_synthesizes(tmp_path, monkeypatch):
+    """A question classified "compound" must be decomposed into sub-questions
+    (each answered via the normal single-SQL path against the real temp DB),
+    then combined by synthesize_answer() into the final answer."""
+    combined = _subsidiary_b(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+    sql_prompts = []
+    json_prompts = []
+
+    class _FakeProvider:
+        def generate_sql(self, prompt):
+            sql_prompts.append(prompt)
+            return "SELECT SUM(plan_2027) AS total FROM budget_items"
+
+        def generate_json(self, prompt):
+            json_prompts.append(prompt)
+            if "simple или compound" in prompt:
+                return "compound"
+            if "Раздели составной вопрос" in prompt:
+                return (
+                    "1. Сколько плана на 2027 год у ГО?\n"
+                    "2. Сколько плана на 2027 год у остальных подразделений?"
+                )
+            if "исходный составной вопрос" in prompt:
+                return "Итоговый ответ: суммарно 9 800 KZT."
+            raise AssertionError(f"unexpected generate_json prompt: {prompt!r}")
+
+    monkeypatch.setattr(file_sql, "_get_client", lambda: _FakeProvider())
+
+    answer = answer_over_file("сравни план ГО и остальных подразделений на 2027 год", combined, {"unit": 1000})
+
+    assert answer == "Итоговый ответ: суммарно 9 800 KZT."
+    # classify + decompose + synthesize = 3 generate_json calls; _phrase_answer
+    # is never reached on the compound path.
+    assert len(json_prompts) == 3
+    # one generate_sql call per sub-question
+    assert len(sql_prompts) == 2
+
+
+def test_compound_capped_at_max_subquestions(tmp_path, monkeypatch):
+    """Even if decompose_question returns more than 4 sub-questions, only 4
+    are actually run."""
+    combined = _subsidiary_b(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+    sql_prompts = []
+
+    class _FakeProvider:
+        def generate_sql(self, prompt):
+            sql_prompts.append(prompt)
+            return "SELECT SUM(plan_2027) AS total FROM budget_items"
+
+        def generate_json(self, prompt):
+            if "simple или compound" in prompt:
+                return "compound"
+            if "Раздели составной вопрос" in prompt:
+                return "\n".join(f"{i}. Подвопрос номер {i}?" for i in range(1, 7))  # 6 items
+            if "исходный составной вопрос" in prompt:
+                return "Итог по всем подвопросам."
+            raise AssertionError(f"unexpected generate_json prompt: {prompt!r}")
+
+    monkeypatch.setattr(file_sql, "_get_client", lambda: _FakeProvider())
+
+    answer = answer_over_file("составной вопрос с шестью частями", combined, {"unit": 1000})
+
+    assert answer == "Итог по всем подвопросам."
+    assert len(sql_prompts) == 4  # capped, not 6
+
+
+def test_classification_failure_falls_back_to_simple_path(tmp_path, monkeypatch, caplog):
+    """If classify_question() itself raises (e.g. a transient provider error),
+    the question must still be answered via the simple single-SQL path rather
+    than aborting the whole call."""
+    combined = _subsidiary_b(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+    class _FakeProvider:
+        def generate_sql(self, prompt):
+            return "SELECT SUM(plan_2027) AS total FROM budget_items"
+
+        def generate_json(self, prompt):
+            if "simple или compound" in prompt:
+                raise RuntimeError("classification service unavailable")
+            return "Итог: план 2027 = 9 800."
+
+    monkeypatch.setattr(file_sql, "_get_client", lambda: _FakeProvider())
+
+    with caplog.at_level("INFO"):
+        answer = answer_over_file("сколько всего плана на 2027 год", combined, {"unit": 1000})
+
+    assert answer == "Итог: план 2027 = 9 800."
+    assert "classification failed" in caplog.text
+    assert "treating as simple" in caplog.text
+
+
 def test_returns_none_on_empty_provider_answer(tmp_path, monkeypatch):
     """A real OpenRouterProvider whose model returns an empty message.content
     (observed with Qwen3.6's reasoning mode exhausting the output budget)
