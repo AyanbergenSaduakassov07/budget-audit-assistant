@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Protocol
 
 import openai
@@ -65,6 +66,20 @@ def _is_daily_quota_error(status_code: int | None, message: str) -> bool:
     return any(marker in message for marker in _DAILY_QUOTA_MARKERS)
 
 
+def _log_call(model: str, started_at: float, response, attempt: int) -> None:
+    """Log a successful LLM API call: timestamp, tokens_used, latency_ms —
+    per the project's logging requirement. tokens_used is None (not guessed)
+    when response.usage.total_tokens isn't populated (OpenRouter's Qwen
+    route may or may not include it)."""
+    latency_ms = (time.perf_counter() - started_at) * 1000
+    usage = getattr(response, "usage", None)
+    tokens_used = getattr(usage, "total_tokens", None) if usage is not None else None
+    logger.info(
+        "LLM call succeeded timestamp=%s model=%s attempt=%d tokens_used=%s latency_ms=%.1f",
+        datetime.now(timezone.utc).isoformat(), model, attempt + 1, tokens_used, latency_ms,
+    )
+
+
 class OpenRouterProvider:
     """openai SDK client pointed at OpenRouter."""
 
@@ -77,6 +92,7 @@ class OpenRouterProvider:
 
     def _complete(self, prompt: str) -> str:
         for attempt in range(_MAX_ATTEMPTS):
+            started_at = time.perf_counter()
             try:
                 response = self._client.chat.completions.create(
                     model=self._model,
@@ -91,19 +107,49 @@ class OpenRouterProvider:
                         "(reasoning mode may have consumed the output budget)",
                         self._model,
                     )
+                _log_call(self._model, started_at, response, attempt)
                 return content
             except openai.APIStatusError as exc:
+                latency_ms = (time.perf_counter() - started_at) * 1000
                 if _is_daily_quota_error(exc.status_code, str(exc)):
+                    logger.info(
+                        "LLM call failed timestamp=%s model=%s attempt=%d "
+                        "latency_ms=%.1f outcome=daily_quota_exhausted",
+                        datetime.now(timezone.utc).isoformat(),
+                        self._model, attempt + 1, latency_ms,
+                    )
                     raise DailyQuotaExhausted(str(exc)) from exc
                 transient = exc.status_code in _RETRY_STATUS
                 if not transient or attempt == _MAX_ATTEMPTS - 1:
+                    logger.info(
+                        "LLM call failed timestamp=%s model=%s attempt=%d "
+                        "latency_ms=%.1f outcome=%s",
+                        datetime.now(timezone.utc).isoformat(), self._model,
+                        attempt + 1, latency_ms,
+                        "non_retryable" if not transient else "retries_exhausted",
+                    )
                     raise
+                logger.info(
+                    "LLM call retrying timestamp=%s model=%s attempt=%d latency_ms=%.1f",
+                    datetime.now(timezone.utc).isoformat(), self._model, attempt + 1, latency_ms,
+                )
                 time.sleep(_BASE_DELAY_S * (2**attempt))
             except (openai.APIConnectionError, openai.APITimeoutError):
                 # Network reset/timeout, not a status response — no status
                 # code to inspect, just retry with the same backoff.
+                latency_ms = (time.perf_counter() - started_at) * 1000
                 if attempt == _MAX_ATTEMPTS - 1:
+                    logger.info(
+                        "LLM call failed timestamp=%s model=%s attempt=%d "
+                        "latency_ms=%.1f outcome=connection_error",
+                        datetime.now(timezone.utc).isoformat(),
+                        self._model, attempt + 1, latency_ms,
+                    )
                     raise
+                logger.info(
+                    "LLM call retrying timestamp=%s model=%s attempt=%d latency_ms=%.1f",
+                    datetime.now(timezone.utc).isoformat(), self._model, attempt + 1, latency_ms,
+                )
                 time.sleep(_BASE_DELAY_S * (2**attempt))
         raise RuntimeError("retry loop exited without a result")
 

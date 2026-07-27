@@ -5,6 +5,9 @@ empty message.content (reasoning mode exhausting the output budget) and an
 uncaught network error crashing the retry loop instead of retrying it.
 """
 
+import contextlib
+import logging
+
 import httpx
 import openai
 import pytest
@@ -25,11 +28,14 @@ def _provider(client) -> OpenRouterProvider:
     return provider
 
 
-def _completion(content: str):
+def _completion(content: str, usage_total_tokens: int | None = None):
     class _Msg:
         pass
 
     class _Choice:
+        pass
+
+    class _Usage:
         pass
 
     class _Response:
@@ -41,7 +47,35 @@ def _completion(content: str):
     choice.message = msg
     response = _Response()
     response.choices = [choice]
+    if usage_total_tokens is not None:
+        usage = _Usage()
+        usage.total_tokens = usage_total_tokens
+        response.usage = usage
     return response
+
+
+@contextlib.contextmanager
+def _captured_logs():
+    """Attach a temporary handler to legacy.llm_providers' logger (and force
+    its level to INFO -- the default WARNING would otherwise filter out
+    logger.info() calls before any handler ever sees them); yields the list
+    of captured message strings (mutated in place as records arrive)."""
+    caught = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            caught.append(record.getMessage())
+
+    logger = logging.getLogger("legacy.llm_providers")
+    handler = _Handler()
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield caught
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
 
 
 def _connection_error() -> openai.APIConnectionError:
@@ -106,6 +140,105 @@ def test_complete_passes_max_tokens_and_disables_reasoning():
     assert provider._complete("prompt") == "ok"
     assert fake_client.kwargs["max_tokens"] == _OPENROUTER_MAX_OUTPUT_TOKENS
     assert fake_client.kwargs["extra_body"] == _OPENROUTER_REASONING_EXTRA_BODY
+
+
+# --- call logging (project rule: every LLM API call gets timestamp/tokens/latency) --
+def test_complete_logs_call_details_on_success():
+    """A successful call must log a timestamp, the model, the attempt number,
+    tokens_used, and latency_ms."""
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs):
+            return _completion("ok")
+
+    provider = _provider(_FakeClient())
+
+    with _captured_logs() as caught:
+        assert provider._complete("prompt") == "ok"
+
+    (msg,) = [m for m in caught if m.startswith("LLM call succeeded")]
+    assert "timestamp=" in msg
+    assert "model=test-model" in msg
+    assert "attempt=1" in msg
+    assert "latency_ms=" in msg
+    # response.usage wasn't set on the fake response -> logged as None, not guessed.
+    assert "tokens_used=None" in msg
+
+
+def test_complete_logs_actual_token_count_when_response_provides_it():
+    """When response.usage.total_tokens IS populated, log the real number."""
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs):
+            return _completion("ok", usage_total_tokens=123)
+
+    provider = _provider(_FakeClient())
+
+    with _captured_logs() as caught:
+        assert provider._complete("prompt") == "ok"
+
+    (msg,) = [m for m in caught if m.startswith("LLM call succeeded")]
+    assert "tokens_used=123" in msg
+
+
+def test_complete_logs_each_retry_attempt(monkeypatch):
+    """Every retried attempt must be logged, not just the final success."""
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                raise _connection_error()
+            return _completion("recovered")
+
+    provider = _provider(_FakeClient())
+    monkeypatch.setattr("legacy.llm_providers.time.sleep", lambda *_a, **_k: None)
+
+    with _captured_logs() as caught:
+        assert provider._complete("prompt") == "recovered"
+
+    retry_msgs = [m for m in caught if m.startswith("LLM call retrying")]
+    assert len(retry_msgs) == 2  # attempts 1 and 2 failed, attempt 3 succeeded
+    assert "attempt=1" in retry_msgs[0]
+    assert "attempt=2" in retry_msgs[1]
+    assert any(m.startswith("LLM call succeeded") for m in caught)
+
+
+def test_complete_logs_final_failure(monkeypatch):
+    """Exhausting all retries must log a final failure with attempt/latency,
+    even though no token count is available."""
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs):
+            raise _connection_error()
+
+    provider = _provider(_FakeClient())
+    monkeypatch.setattr("legacy.llm_providers.time.sleep", lambda *_a, **_k: None)
+
+    with _captured_logs() as caught:
+        with pytest.raises(openai.APIConnectionError):
+            provider._complete("prompt")
+
+    (msg,) = [m for m in caught if m.startswith("LLM call failed")]
+    assert "outcome=connection_error" in msg
+    assert "latency_ms=" in msg
 
 
 # --- retry on network errors ------------------------------------------------------
