@@ -20,6 +20,7 @@ from core.budget_auditor.parser import (
     capex_opex_table,
     year_trend,
     _best_baseline_col,
+    MAX_SHEET_ROWS,
 )
 from core.budget_auditor.analysis import (
     workbook_summary_text,
@@ -127,6 +128,41 @@ def app_helpers():
     ns = {}
     exec(compile(head, str(ROOT / "app.py"), "exec"), ns)
     return ns
+
+
+# --- oversized-file guard (row-count sanity check before parsing) --------------
+def test_parse_workbook_rejects_oversized_sheet(tmp_path, monkeypatch):
+    """A sheet whose ws.max_row exceeds MAX_SHEET_ROWS must be rejected with a
+    clear Russian message BEFORE any per-sheet parsing runs -- a pathological
+    file (e.g. a full transactional export, not a ИТ-бюджет form) must fail fast,
+    not after fully parsing. Faking max_row via a class-level monkeypatch
+    avoids actually writing 5000+ rows to build the fixture."""
+    import core.budget_auditor.parser as parser_module
+    from openpyxl.worksheet.worksheet import Worksheet
+
+    path = _full_form_workbook(tmp_path / "oversized.xlsx")
+
+    def _must_not_run(*a, **k):
+        raise AssertionError("full parse must not run once the row-count guard fires")
+
+    monkeypatch.setattr(parser_module, "read_metadata", _must_not_run)
+    monkeypatch.setattr(parser_module, "parse_sheet", _must_not_run)
+    monkeypatch.setattr(Worksheet, "max_row", property(lambda self: MAX_SHEET_ROWS + 1))
+
+    with pytest.raises(ValueError, match="Файл слишком большой для обработки"):
+        parse_workbook(path)
+
+
+def test_parse_workbook_accepts_sheet_at_the_row_limit(tmp_path, monkeypatch):
+    """The guard must be a strict '>' -- a sheet exactly at MAX_SHEET_ROWS is
+    still accepted, not rejected off-by-one."""
+    from openpyxl.worksheet.worksheet import Worksheet
+
+    path = _full_form_workbook(tmp_path / "at_limit.xlsx")
+    monkeypatch.setattr(Worksheet, "max_row", property(lambda self: MAX_SHEET_ROWS))
+
+    meta, sheets = parse_workbook(path)
+    assert meta["company"] == "ТОО Тест-Дочка"
 
 
 # --- full-form (Subsidiary A-style) pipeline -------------------------------------------

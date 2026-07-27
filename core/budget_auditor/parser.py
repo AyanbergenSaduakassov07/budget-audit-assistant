@@ -57,6 +57,13 @@ import re
 import openpyxl
 import pandas as pd
 
+# Real budget forms run a few hundred rows per sheet; this is generous headroom,
+# not a tight fit. A sheet past this is almost certainly not a ИТ-бюджет form (e.g.
+# a full transactional export) and parsing it fully would be slow for no
+# useful result -- reject before the per-sheet parse loop runs at all, not
+# after. Raise this constant if a legitimate large subsidiary file needs it.
+MAX_SHEET_ROWS = 5000
+
 
 # Roles that are NOT year-numbered -- looked up by a fixed substring signature.
 # ("описание"/"обоснование" match independently so a merged header gets both.)
@@ -324,6 +331,15 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
 
 def parse_workbook(path):
     wb = openpyxl.load_workbook(path, data_only=True)
+
+    for sn in wb.sheetnames:
+        if wb[sn].max_row and wb[sn].max_row > MAX_SHEET_ROWS:
+            raise ValueError(
+                "Файл слишком большой для обработки — проверьте, что это "
+                "форма, а не полная выгрузка "
+                f"(лист «{sn}»: {wb[sn].max_row} строк, лимит {MAX_SHEET_ROWS})."
+            )
+
     sheets_out = {}
     meta = None
     for sn in wb.sheetnames:

@@ -6,3 +6,8 @@ primaryColor = "#1F3A5F"
 backgroundColor = "#FAF9F6"
 secondaryBackgroundColor = "#FFFFFF"
 textColor = "#2C2C2A"
+
+# Real budget forms are small spreadsheets; 25MB is generous headroom while
+# ruling out multi-hundred-MB uploads.
+[server]
+maxUploadSize = 25
