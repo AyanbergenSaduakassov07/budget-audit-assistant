@@ -4,8 +4,12 @@ legacy.query_engine and core.budget_narrator drive an LLMProvider through two
 methods, generate_sql(prompt) and generate_json(prompt), instead of importing
 google.genai (or openai) directly. Provider selection (get_provider):
 OPENROUTER_API_KEY set -> OpenRouterProvider (openai SDK, base_url pointed at
-OpenRouter); otherwise GEMINI_API_KEY -> GeminiProvider. Gemini stays the
-default so existing behavior is unchanged unless OPENROUTER_API_KEY is set.
+OpenRouter). Gemini never activates implicitly (per ACM Digital VP
+directive) -- GeminiProvider only constructs when ALLOW_GEMINI=1 is ALSO set
+explicitly alongside GEMINI_API_KEY; GEMINI_API_KEY being present is no
+longer sufficient by itself. Without OPENROUTER_API_KEY and without
+ALLOW_GEMINI=1, get_provider() raises RuntimeError even if GEMINI_API_KEY
+is set.
 
 Both providers implement the same retry/backoff policy (_RETRY_STATUS,
 _MAX_ATTEMPTS, _BASE_DELAY_S) and raise DailyQuotaExhausted on a
@@ -163,19 +167,27 @@ class OpenRouterProvider:
 def get_provider() -> LLMProvider:
     """Select the active provider, or fail with a clear message.
 
-    OPENROUTER_API_KEY set -> OpenRouter. Otherwise GEMINI_API_KEY -> Gemini
-    (the pre-existing default). Neither set -> RuntimeError.
+    OPENROUTER_API_KEY set -> OpenRouter. Otherwise, GEMINI_API_KEY alone is
+    NOT enough -- Gemini must never activate implicitly (per ACM Digital VP
+    directive). GeminiProvider only constructs when ALLOW_GEMINI=1 is ALSO
+    set explicitly. Neither OPENROUTER_API_KEY nor an explicitly-allowed
+    Gemini -> RuntimeError.
     """
     openrouter_key = os.environ.get("OPENROUTER_API_KEY")
     if openrouter_key:
         return OpenRouterProvider(openrouter_key)
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
-    if gemini_key:
+    allow_gemini = os.environ.get("ALLOW_GEMINI") == "1"
+    if gemini_key and allow_gemini:
         return GeminiProvider(gemini_key)
 
     raise RuntimeError(
-        "No LLM provider configured. Set OPENROUTER_API_KEY (OpenRouter) or "
-        "GEMINI_API_KEY (Google Gemini), e.g.:\n"
-        "    export GEMINI_API_KEY=your_key_here"
+        "No LLM provider configured. Set OPENROUTER_API_KEY (OpenRouter). "
+        "Gemini is not used unless explicitly allowed: set GEMINI_API_KEY "
+        "AND ALLOW_GEMINI=1, e.g.:\n"
+        "    export OPENROUTER_API_KEY=your_key_here\n"
+        "or:\n"
+        "    export GEMINI_API_KEY=your_key_here\n"
+        "    export ALLOW_GEMINI=1"
     )
