@@ -111,6 +111,88 @@ def test_success_path_runs_generated_sql(tmp_path, monkeypatch):
     assert "9800" in captured["result_text"].replace(" ", "")  # 9000 + 800
 
 
+# --- bounded self-correction retry after a failing first-attempt SQL ------------
+def test_first_attempt_success_skips_retry(tmp_path, monkeypatch):
+    """A valid first-attempt SQL must not trigger the error-feedback retry."""
+    combined = _subsidiary_b(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setattr(file_sql, "_get_client", lambda: object())
+    monkeypatch.setattr(file_sql, "_generate_sql",
+                        lambda *a, **k: "SELECT SUM(plan_2027) AS total FROM budget_items")
+
+    def _boom(*a, **k):
+        raise AssertionError("retry must not be attempted on a successful first attempt")
+
+    monkeypatch.setattr(file_sql, "_generate_sql_with_error_feedback", _boom)
+    monkeypatch.setattr(file_sql, "_phrase_answer",
+                        lambda client, question, sql, result_text, empty, history=None: "Итог найден.")
+
+    answer = answer_over_file("сколько всего на 2027", combined, {"unit": 1000})
+    assert answer == "Итог найден."
+
+
+def test_retry_recovers_from_failing_first_attempt_sql(tmp_path, monkeypatch, caplog):
+    """First-attempt SQL references a nonexistent column and fails to execute;
+    the corrected retry SQL is valid and its result is used for the answer."""
+    combined = _subsidiary_b(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setattr(file_sql, "_get_client", lambda: object())
+    monkeypatch.setattr(file_sql, "_generate_sql",
+                        lambda *a, **k: "SELECT SUM(no_such_column) FROM budget_items")
+
+    captured = {}
+
+    def _feedback(client, question, schema_description, failed_sql, error_message, history=None):
+        captured["failed_sql"] = failed_sql
+        captured["error_message"] = error_message
+        return "SELECT SUM(plan_2027) AS total FROM budget_items"
+
+    monkeypatch.setattr(file_sql, "_generate_sql_with_error_feedback", _feedback)
+
+    phrased = {}
+
+    def _phrase(client, question, sql, result_text, empty, history=None):
+        phrased["sql"] = sql
+        phrased["result_text"] = result_text
+        return f"Итог: {result_text}"
+
+    monkeypatch.setattr(file_sql, "_phrase_answer", _phrase)
+
+    with caplog.at_level("INFO"):
+        answer = answer_over_file("сколько всего на 2027", combined, {"unit": 1000})
+
+    assert answer is not None
+    assert captured["failed_sql"] == "SELECT SUM(no_such_column) FROM budget_items"
+    assert "no_such_column" in captured["error_message"] or captured["error_message"]
+    assert phrased["sql"] == "SELECT SUM(plan_2027) AS total FROM budget_items"
+    assert "9800" in phrased["result_text"].replace(" ", "")  # 9000 + 800
+    assert "self-correction succeeded" in caplog.text
+    assert "SELECT SUM(no_such_column) FROM budget_items" in caplog.text
+    assert "SELECT SUM(plan_2027) AS total FROM budget_items" in caplog.text
+
+
+def test_retry_also_fails_returns_none_without_raising(tmp_path, monkeypatch, caplog):
+    """Both the first attempt and the corrected retry reference bad columns:
+    answer_over_file() must return None, never raise, and log both SQLs."""
+    combined = _subsidiary_b(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setattr(file_sql, "_get_client", lambda: object())
+    monkeypatch.setattr(file_sql, "_generate_sql",
+                        lambda *a, **k: "SELECT SUM(no_such_column) FROM budget_items")
+    monkeypatch.setattr(
+        file_sql, "_generate_sql_with_error_feedback",
+        lambda *a, **k: "SELECT SUM(still_bad_column) FROM budget_items",
+    )
+
+    with caplog.at_level("INFO"):
+        answer = answer_over_file("сколько всего на 2027", combined, {"unit": 1000})
+
+    assert answer is None
+    assert "retry also failed" in caplog.text
+    assert "SELECT SUM(no_such_column) FROM budget_items" in caplog.text
+    assert "SELECT SUM(still_bad_column) FROM budget_items" in caplog.text
+
+
 def test_returns_none_on_empty_provider_answer(tmp_path, monkeypatch):
     """A real OpenRouterProvider whose model returns an empty message.content
     (observed with Qwen3.6's reasoning mode exhausting the output budget)

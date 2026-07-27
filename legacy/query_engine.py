@@ -137,6 +137,42 @@ def _generate_sql(
     return _strip_sql_fences(client.generate_sql(prompt))
 
 
+def _generate_sql_with_error_feedback(
+    client: LLMProvider,
+    question: str,
+    schema_description: str,
+    failed_sql: str,
+    error_message: str,
+    history: list[tuple[str, str]] | None = None,
+) -> str:
+    """One-shot self-correction: tell the model its previous SQL failed with
+    this exact error, and ask for a single corrected SQLite SELECT.
+
+    Used by callers that want a bounded retry after warehouse.run_sql()
+    raises (see core.budget_auditor.file_sql.answer_over_file) — not part of
+    the initial-attempt path, which stays on the plain _generate_sql().
+    """
+    prompt = (
+        "You are a SQL generator for a procurement database (SQLite). "
+        "Your previous attempt at writing a SQLite SELECT query for this "
+        "question failed when executed. Fix it and return exactly ONE valid "
+        "SQLite SELECT query that answers the question. Rules:\n"
+        "- Output ONLY the SQL. No explanation, no comments, no markdown fences.\n"
+        "- Use only the table and columns from the schema below.\n"
+        "- Category and subsidiary/branch values are stored verbatim; filter "
+        "on the EXACT stored strings shown in the schema; never translate or "
+        "invent them.\n\n"
+        f"{schema_description}\n"
+        f"{_format_history(history)}"
+        f"Вопрос: {question}\n\n"
+        f"Предыдущий SQL (не выполнился):\n{failed_sql}\n\n"
+        f"Ошибка выполнения:\n{error_message}\n\n"
+        "Исправленный SQL:"
+    )
+
+    return _strip_sql_fences(client.generate_sql(prompt))
+
+
 # SQL result frames can hold very large sums (e.g. workbook-wide totals in
 # raw тенге); pandas' df.to_string() renders those in scientific notation
 # (e.g. "1.5e+11"), and a model asked to "use only the numbers from the

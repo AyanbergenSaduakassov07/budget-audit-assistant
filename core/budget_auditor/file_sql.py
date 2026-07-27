@@ -38,6 +38,7 @@ from legacy import warehouse
 from legacy.query_engine import (
     DailyQuotaExhausted,
     _generate_sql,
+    _generate_sql_with_error_feedback,
     _get_client,
     _phrase_answer,
 )
@@ -201,9 +202,15 @@ def answer_over_file(
     legacy.query_engine._format_history). Text only, no raw data, so this
     doesn't touch the existing data-minimization boundary.
 
+    If the generated SQL fails to execute (bad column, syntax error), one
+    self-correction retry is attempted: the model is shown its own failed SQL
+    and the exact error via legacy.query_engine._generate_sql_with_error_feedback,
+    and asked for a single corrected query. If the retry also fails, this
+    still returns None as before — exactly one retry, not a loop.
+
     Returns the Russian answer string, or None on ANY failure (missing key,
-    quota, empty data, bad SQL, no numeric columns) — the caller then shows its
-    existing not-found message. Never raises.
+    quota, empty data, bad SQL even after the retry, no numeric columns) — the
+    caller then shows its existing not-found message. Never raises.
     """
     try:
         if combined is None or combined.empty:
@@ -223,7 +230,31 @@ def answer_over_file(
             client, question, schema, history=history,
             examples=_BUDGET_ITEMS_SQL_EXAMPLES,
         )
-        df = warehouse.run_sql(sql, db_path)
+
+        try:
+            df = warehouse.run_sql(sql, db_path)
+        except Exception as exc:
+            # Bounded self-correction: one retry, showing the model its own
+            # failed SQL and the exact error, before giving up to None.
+            corrected_sql = _generate_sql_with_error_feedback(
+                client, question, schema, sql, str(exc), history=history,
+            )
+            try:
+                df = warehouse.run_sql(corrected_sql, db_path)
+            except Exception:
+                logger.info(
+                    "file SQL retry also failed for question %r — "
+                    "first attempt: %s | retry: %s",
+                    question, sql, corrected_sql,
+                )
+                return None
+            logger.info(
+                "file SQL self-correction succeeded for question %r — "
+                "first attempt: %s | retry: %s",
+                question, sql, corrected_sql,
+            )
+            sql = corrected_sql
+
         result_text = df.to_string(index=False) if not df.empty else "(пустой результат)"
         answer = _phrase_answer(client, question, sql, result_text, empty=df.empty, history=history)
         return answer or None
