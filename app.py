@@ -619,7 +619,7 @@ with st.popover("⚙️ Настройки"):
         st.session_state["file_chat_history"] = []
         st.session_state.pop("active_file", None)
         st.rerun()
-    st.caption("Аудит IT-бюджетов · MVP v4.0")
+    st.caption("Аудит IT-бюджетов")
 
 submitted = st.chat_input(
     "Загрузите файл или задайте вопрос",
