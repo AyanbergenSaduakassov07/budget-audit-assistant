@@ -100,10 +100,21 @@ def _generate_sql(
     question: str,
     schema_description: str,
     history: list[tuple[str, str]] | None = None,
+    examples: list[tuple[str, str]] | None = None,
 ) -> str:
-    """Ask the model to turn a Russian question into a single SQLite SELECT."""
+    """Ask the model to turn a Russian question into a single SQLite SELECT.
+
+    examples: few-shot (question, SQL) pairs shown to the model. Defaults to
+    _SQL_EXAMPLES (the synthetic `procurements` warehouse) so the answer()
+    call path below is unchanged; callers grounded in a different schema
+    (e.g. core.budget_auditor.file_sql's `budget_items` table) must pass
+    their own set — otherwise the model sees a correct schema description
+    contradicted by worked examples for a table that doesn't exist there.
+    """
+    if examples is None:
+        examples = _SQL_EXAMPLES
     example_block = "\n\n".join(
-        f"Вопрос: {q}\nSQL: {sql}" for q, sql in _SQL_EXAMPLES
+        f"Вопрос: {q}\nSQL: {sql}" for q, sql in examples
     )
 
     prompt = (

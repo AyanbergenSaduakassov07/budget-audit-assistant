@@ -7,8 +7,11 @@ contract. A real end-to-end call is exercised by scripts, not here (it costs
 quota and is non-deterministic).
 """
 
+from legacy.query_engine import _SQL_EXAMPLES
+
 import core.budget_auditor.file_sql as file_sql
 from core.budget_auditor.file_sql import (
+    _BUDGET_ITEMS_SQL_EXAMPLES,
     _schema_description,
     _split_columns,
     answer_over_file,
@@ -146,6 +149,43 @@ def test_returns_none_on_empty_provider_answer(tmp_path, monkeypatch):
 
     combined = _subsidiary_b(tmp_path)
     assert answer_over_file("сколько всего на 2027", combined, {"unit": 1000}) is None
+
+
+# --- few-shot examples: real budget_items schema, not the synthetic warehouse ---
+def test_generated_sql_prompt_uses_budget_items_examples_not_synthetic(tmp_path, monkeypatch):
+    """answer_over_file() must ground SQL generation in _BUDGET_ITEMS_SQL_EXAMPLES,
+    never in query_engine's default _SQL_EXAMPLES (written against the unrelated
+    synthetic `procurements` schema: subtotal/subsidiary/category/year)."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+
+    captured = {}
+
+    class _FakeProvider:
+        def generate_sql(self, prompt):
+            captured["sql_prompt"] = prompt
+            return "SELECT SUM(plan_2027) AS total FROM budget_items"
+
+        def generate_json(self, prompt):
+            return "Итог найден."
+
+    monkeypatch.setattr(file_sql, "_get_client", lambda: _FakeProvider())
+
+    combined = _subsidiary_b(tmp_path)
+    answer = answer_over_file("сколько всего на 2027", combined, {"unit": 1000})
+
+    assert answer is not None
+    sql_prompt = captured["sql_prompt"]
+
+    # A budget_items example must be present verbatim.
+    sample_question, sample_sql = _BUDGET_ITEMS_SQL_EXAMPLES[0]
+    assert sample_question in sql_prompt
+    assert sample_sql in sql_prompt
+
+    # None of the synthetic-warehouse examples (procurements/subtotal/subsidiary)
+    # may leak into a file-level prompt.
+    for _, sql in _SQL_EXAMPLES:
+        assert sql not in sql_prompt
+    assert "procurements" not in sql_prompt
 
 
 # --- conversation history threaded into the SQL/answer prompts ------------------

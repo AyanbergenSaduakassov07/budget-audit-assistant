@@ -63,6 +63,35 @@ _MONEY_MEANING = {
     "forecast": "прогноз на",
 }
 
+# Few-shot examples grounded in THIS module's real `budget_items` schema
+# (branch, cost_type, statya_code, plan_<year>/fact_<year>/forecast_<year>).
+# Passed explicitly into _generate_sql() instead of falling back to
+# query_engine's default _SQL_EXAMPLES, which are written against the
+# unrelated synthetic `procurements` table (subtotal/subsidiary/category/year)
+# and would otherwise show the model a correct schema description alongside
+# contradictory worked examples for a table that doesn't exist here.
+_BUDGET_ITEMS_SQL_EXAMPLES = [
+    (
+        "Сколько всего плана на 2027 год?",
+        "SELECT SUM(plan_2027) FROM budget_items",
+    ),
+    (
+        "Сравни план на 2027 год по подразделениям.",
+        "SELECT branch, SUM(plan_2027) AS total FROM budget_items "
+        "GROUP BY branch",
+    ),
+    (
+        "Раздели план на 2027 год на OPEX и CAPEX.",
+        "SELECT cost_type, SUM(plan_2027) AS total FROM budget_items "
+        "GROUP BY cost_type",
+    ),
+    (
+        "Сколько потратили на контрагента ТОО Прогресс в 2027 году?",
+        "SELECT SUM(fact_2027) FROM budget_items "
+        "WHERE counterparty = 'ТОО Прогресс'",
+    ),
+]
+
 
 def _split_columns(combined: pd.DataFrame) -> tuple[list[str], list[str]]:
     dims = [c for c in _DIM_COLS if c in combined.columns]
@@ -190,7 +219,10 @@ def answer_over_file(
     try:
         db_path = _load_temp_db(combined, dims, money)
         schema = _schema_description(combined, meta or {}, dims, money)
-        sql = _generate_sql(client, question, schema, history=history)
+        sql = _generate_sql(
+            client, question, schema, history=history,
+            examples=_BUDGET_ITEMS_SQL_EXAMPLES,
+        )
         df = warehouse.run_sql(sql, db_path)
         result_text = df.to_string(index=False) if not df.empty else "(пустой результат)"
         answer = _phrase_answer(client, question, sql, result_text, empty=df.empty, history=history)

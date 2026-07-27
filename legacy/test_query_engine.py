@@ -9,7 +9,57 @@ import pytest
 
 from legacy.synth import generate_group
 from legacy.warehouse import build_warehouse, run_sql
-from legacy.query_engine import _format_history, _phrase_answer, answer
+from legacy.query_engine import (
+    _SQL_EXAMPLES,
+    _format_history,
+    _generate_sql,
+    _phrase_answer,
+    answer,
+)
+
+
+# --- few-shot example selection (regression) -------------------------------------
+# _generate_sql() must default to the synthetic `procurements` warehouse examples
+# unless a caller (e.g. core.budget_auditor.file_sql) explicitly passes its own
+# schema-appropriate set.
+def test_generate_sql_defaults_to_synthetic_examples():
+    captured = {}
+
+    class _FakeProvider:
+        def generate_sql(self, prompt):
+            captured["prompt"] = prompt
+            return "SELECT 1"
+
+    _generate_sql(_FakeProvider(), "Сколько всего?", "Table: procurements")
+
+    prompt = captured["prompt"]
+    # A sample question/SQL pair unique to _SQL_EXAMPLES must be present verbatim.
+    sample_question, sample_sql = _SQL_EXAMPLES[0]
+    assert sample_question in prompt
+    assert sample_sql in prompt
+    # And nothing from a foreign schema (e.g. budget_items) leaks in.
+    assert "budget_items" not in prompt
+
+
+def test_generate_sql_uses_explicit_examples_when_given():
+    captured = {}
+
+    class _FakeProvider:
+        def generate_sql(self, prompt):
+            captured["prompt"] = prompt
+            return "SELECT 1"
+
+    custom_examples = [("Сколько плана на 2027?", "SELECT SUM(plan_2027) FROM budget_items")]
+    _generate_sql(
+        _FakeProvider(), "Сколько плана на 2027?", "Table: budget_items",
+        examples=custom_examples,
+    )
+
+    prompt = captured["prompt"]
+    assert "SELECT SUM(plan_2027) FROM budget_items" in prompt
+    # The default synthetic-warehouse examples must NOT also appear.
+    for _, sql in _SQL_EXAMPLES:
+        assert sql not in prompt
 
 
 # --- number formatting in the phrased answer (regression) -----------------------
