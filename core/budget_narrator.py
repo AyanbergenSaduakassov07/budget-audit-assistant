@@ -1,4 +1,4 @@
-"""Turn a run_full_audit() result into a short Russian narrative via Gemini.
+"""Turn a run_full_audit() result into a short Russian narrative via an LLM.
 
 Deliberately data-minimized: the prompt sent to the model carries only
 aggregate counts/amounts, supplier *names* with delta_pct (never raw тыс. тг
@@ -9,7 +9,7 @@ reasons over shapes and aggregates, the same way a human reviewer's summary
 would cite "significant growth at Supplier X" without republishing the ledger.
 
 Uses the same pluggable-provider client/retry plumbing as legacy.query_engine
-(Gemini by default, OpenRouter when OPENROUTER_API_KEY is set).
+(OpenRouter, via OPENROUTER_API_KEY — the only provider this codebase supports).
 
 Per SPEC.md architecture rule: this module is pure — no streamlit imports.
 """
@@ -149,7 +149,7 @@ def _parse_narrative(raw_text: str) -> dict:
 
 
 def narrate_audit(audit_result: dict) -> dict:
-    """Generate a Russian narrative for a run_full_audit() result via Gemini.
+    """Generate a Russian narrative for a run_full_audit() result via the LLM.
 
     Returns audit_result merged with a "narrative" key. Never raises: any
     client/API/parse failure is caught and surfaced as narrative["error"]

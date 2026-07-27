@@ -1,7 +1,7 @@
-"""Tests for core.budget_auditor.file_sql — the Gemini text-to-SQL fallback
+"""Tests for core.budget_auditor.file_sql — the LLM text-to-SQL fallback
 over the current file's data.
 
-Live Gemini calls are mocked; the focus is the plumbing (table build, schema
+Live LLM calls are mocked; the focus is the plumbing (table build, schema
 grounding, SELECT execution) and the never-raises / graceful-degradation
 contract. A real end-to-end call is exercised by scripts, not here (it costs
 quota and is non-deterministic).
@@ -204,13 +204,13 @@ def test_schema_omits_both_warnings_when_neither_gap_applies(tmp_path):
 
 # --- graceful degradation (never raises, returns None) --------------------------
 def test_returns_none_without_key(tmp_path, monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert answer_over_file("сравни года", _subsidiary_b(tmp_path), {"unit": 1000}) is None
 
 
 def test_returns_none_on_empty_or_no_money(tmp_path, monkeypatch):
     import pandas as pd
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
     assert answer_over_file("что угодно", None, {}) is None
     assert answer_over_file("что угодно", pd.DataFrame(), {}) is None
     # A frame with dims but no plan_/fact_/forecast_ column -> nothing to query.
@@ -219,7 +219,7 @@ def test_returns_none_on_empty_or_no_money(tmp_path, monkeypatch):
 
 
 def test_returns_none_on_quota_exhausted(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
     monkeypatch.setattr(file_sql, "_get_client", lambda: object())
 
     def _boom(*a, **k):
@@ -230,7 +230,7 @@ def test_returns_none_on_quota_exhausted(tmp_path, monkeypatch):
 
 
 def test_returns_none_on_bad_sql(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
     monkeypatch.setattr(file_sql, "_get_client", lambda: object())
     # Model returns a non-SELECT statement -> warehouse.run_sql rejects it ->
     # exception swallowed -> None (never surfaced as an error).
@@ -241,7 +241,7 @@ def test_returns_none_on_bad_sql(tmp_path, monkeypatch):
 # --- success path (mocked model), real SQLite execution -------------------------
 def test_success_path_runs_generated_sql(tmp_path, monkeypatch):
     combined = _subsidiary_b(tmp_path)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
     monkeypatch.setattr(file_sql, "_get_client", lambda: object())
     # A real, valid SELECT over the per-file table — actually executed by
     # warehouse.run_sql against the temp DB the fallback builds.
@@ -268,7 +268,7 @@ def test_success_path_runs_generated_sql(tmp_path, monkeypatch):
 def test_first_attempt_success_skips_retry(tmp_path, monkeypatch):
     """A valid first-attempt SQL must not trigger the error-feedback retry."""
     combined = _subsidiary_b(tmp_path)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
     monkeypatch.setattr(file_sql, "_get_client", lambda: object())
     monkeypatch.setattr(file_sql, "_generate_sql",
                         lambda *a, **k: "SELECT SUM(plan_2027) AS total FROM budget_items")
@@ -288,7 +288,7 @@ def test_retry_recovers_from_failing_first_attempt_sql(tmp_path, monkeypatch, ca
     """First-attempt SQL references a nonexistent column and fails to execute;
     the corrected retry SQL is valid and its result is used for the answer."""
     combined = _subsidiary_b(tmp_path)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
     monkeypatch.setattr(file_sql, "_get_client", lambda: object())
     monkeypatch.setattr(file_sql, "_generate_sql",
                         lambda *a, **k: "SELECT SUM(no_such_column) FROM budget_items")
@@ -328,7 +328,7 @@ def test_retry_also_fails_returns_none_without_raising(tmp_path, monkeypatch, ca
     """Both the first attempt and the corrected retry reference bad columns:
     answer_over_file() must return None, never raise, and log both SQLs."""
     combined = _subsidiary_b(tmp_path)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
     monkeypatch.setattr(file_sql, "_get_client", lambda: object())
     monkeypatch.setattr(file_sql, "_generate_sql",
                         lambda *a, **k: "SELECT SUM(no_such_column) FROM budget_items")
@@ -353,7 +353,7 @@ def test_classified_simple_takes_single_sql_path_unchanged(tmp_path, monkeypatch
     for the classification, one more for _phrase_answer — no decomposition or
     synthesis call is ever made."""
     combined = _subsidiary_b(tmp_path)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
 
     json_prompts = []
 
@@ -381,7 +381,7 @@ def test_compound_question_runs_subqueries_and_synthesizes(tmp_path, monkeypatch
     (each answered via the normal single-SQL path against the real temp DB),
     then combined by synthesize_answer() into the final answer."""
     combined = _subsidiary_b(tmp_path)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
 
     sql_prompts = []
     json_prompts = []
@@ -420,7 +420,7 @@ def test_compound_capped_at_max_subquestions(tmp_path, monkeypatch):
     """Even if decompose_question returns more than 4 sub-questions, only 4
     are actually run."""
     combined = _subsidiary_b(tmp_path)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
 
     sql_prompts = []
 
@@ -451,7 +451,7 @@ def test_classification_failure_falls_back_to_simple_path(tmp_path, monkeypatch,
     the question must still be answered via the simple single-SQL path rather
     than aborting the whole call."""
     combined = _subsidiary_b(tmp_path)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
 
     class _FakeProvider:
         def generate_sql(self, prompt):
@@ -496,7 +496,7 @@ def test_returns_none_on_empty_provider_answer(tmp_path, monkeypatch):
         def create(self, **kwargs):
             return _EmptyResponse()
 
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
 
     provider = OpenRouterProvider.__new__(OpenRouterProvider)
     provider._model = "test-model"
@@ -517,7 +517,7 @@ def test_generated_sql_prompt_uses_budget_items_examples_not_synthetic(tmp_path,
     """answer_over_file() must ground SQL generation in _BUDGET_ITEMS_SQL_EXAMPLES,
     never in query_engine's default _SQL_EXAMPLES (written against the unrelated
     synthetic `procurements` schema: subtotal/subsidiary/category/year)."""
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
 
     captured = {}
 
@@ -555,7 +555,7 @@ def test_history_threaded_into_generated_sql_prompt(tmp_path, monkeypatch):
     first ('раздели планы на opex/capex по всем годам' then just 'а за все
     года') -- the prior turn must reach the real _generate_sql()/_phrase_answer()
     prompts, not be silently dropped."""
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
 
     captured = {}
 
@@ -596,7 +596,7 @@ def test_history_threaded_into_generated_sql_prompt(tmp_path, monkeypatch):
 def test_no_history_omits_prior_turns_block(tmp_path, monkeypatch):
     """Without a history argument (the default), the prompt must be identical
     in shape to before this change -- no empty 'Предыдущие вопросы' block."""
-    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
 
     captured = {}
 

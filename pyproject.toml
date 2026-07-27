@@ -5,7 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "google-genai>=2.11.0",
     "openai>=2.45.0",
     "openpyxl>=3.1.5",
     "pandas>=3.0.3",
@@ -21,4 +20,4 @@ dev = [
 # Flat layout: make the project root importable so tests can use absolute
 # imports (from core.synth import generate) without an editable install.
 pythonpath = ["."]
-markers = ["api: tests that call the live Gemini API (costs quota, run selectively)"]
+markers = ["api: tests that call the live OpenRouter API (costs quota, run selectively)"]

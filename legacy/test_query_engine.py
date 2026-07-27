@@ -1,6 +1,6 @@
 """Tests for the Russian query engine and the warehouse layer beneath it.
 
-The query engine calls the live Gemini API (paid / daily-quota limited), so the
+The query engine calls the live OpenRouter API (paid / daily-quota limited), so the
 two tests that hit it are marked `@pytest.mark.api` and can be deselected with
 `-m "not api"`. The warehouse-only test runs for free and needs no marker.
 """

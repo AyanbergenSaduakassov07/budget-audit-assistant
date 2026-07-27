@@ -6,9 +6,9 @@ in Russian using ONLY the numbers returned by the database. The model never
 invents figures; every number in the answer comes from the query result.
 
 The LLM call itself is routed through legacy.llm_providers.get_provider():
-Gemini via its native SDK (`google-genai`) by default, or OpenRouter (openai
-SDK) when OPENROUTER_API_KEY is set. See llm_providers.py for the provider
-interface and the shared retry/backoff + DailyQuotaExhausted contract.
+OpenRouter (openai SDK) when OPENROUTER_API_KEY is set — the only provider
+this codebase supports. See llm_providers.py for the provider interface and
+the retry/backoff + DailyQuotaExhausted contract.
 
 Per SPEC.md architecture rule: this module is pure — no streamlit imports.
 """

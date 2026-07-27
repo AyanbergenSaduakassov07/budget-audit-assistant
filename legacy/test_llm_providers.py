@@ -11,7 +11,6 @@ import pytest
 
 from legacy.llm_providers import (
     DailyQuotaExhausted,
-    GeminiProvider,
     OpenRouterProvider,
     _OPENROUTER_MAX_OUTPUT_TOKENS,
     _OPENROUTER_REASONING_EXTRA_BODY,
@@ -155,53 +154,15 @@ def test_complete_gives_up_after_max_attempts_of_connection_errors(monkeypatch):
         provider._complete("prompt")
 
 
-# --- get_provider() selection: Gemini must never activate implicitly -------------
+# --- get_provider() selection: OpenRouter is the only provider ------------------
 def _clear_provider_env(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("ALLOW_GEMINI", raising=False)
 
 
 def test_get_provider_selects_openrouter_when_key_set(monkeypatch):
     _clear_provider_env(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "fake-openrouter-key")
     assert isinstance(get_provider(), OpenRouterProvider)
-
-
-def test_get_provider_prefers_openrouter_even_with_gemini_allowed(monkeypatch):
-    """OPENROUTER_API_KEY still takes priority when both are configured."""
-    _clear_provider_env(monkeypatch)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-openrouter-key")
-    monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
-    monkeypatch.setenv("ALLOW_GEMINI", "1")
-    assert isinstance(get_provider(), OpenRouterProvider)
-
-
-def test_get_provider_selects_gemini_only_when_explicitly_allowed(monkeypatch):
-    """Per the ACM Digital VP directive, GEMINI_API_KEY alone is not enough --
-    Gemini only activates with the explicit ALLOW_GEMINI=1 opt-in."""
-    _clear_provider_env(monkeypatch)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
-    monkeypatch.setenv("ALLOW_GEMINI", "1")
-    assert isinstance(get_provider(), GeminiProvider)
-
-
-def test_get_provider_raises_on_gemini_key_alone_without_allow_gemini(monkeypatch):
-    """GEMINI_API_KEY being present must NOT silently fall back to Gemini --
-    this is the regression this fix closes."""
-    _clear_provider_env(monkeypatch)
-    monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
-    with pytest.raises(RuntimeError):
-        get_provider()
-
-
-def test_get_provider_raises_when_allow_gemini_set_without_key(monkeypatch):
-    """ALLOW_GEMINI=1 alone, with no GEMINI_API_KEY, still has nothing to
-    construct a provider from."""
-    _clear_provider_env(monkeypatch)
-    monkeypatch.setenv("ALLOW_GEMINI", "1")
-    with pytest.raises(RuntimeError):
-        get_provider()
 
 
 def test_get_provider_raises_when_nothing_configured(monkeypatch):

@@ -360,7 +360,7 @@ def _cached_conclusion_docx(file_bytes: bytes, threshold: float) -> tuple[bytes,
 
 @st.cache_data(show_spinner="Формирую заключение…")
 def _cached_opening(file_bytes: bytes, threshold: float) -> str | None:
-    """Gemini executive summary for the analysis opening, cached per
+    """LLM executive summary for the analysis opening, cached per
     (file, threshold) so history re-renders never repeat the API call.
     None (no key / any failure) means: use the template summary."""
     a = _analyze(file_bytes, threshold)
@@ -505,7 +505,7 @@ def render_analysis(entry: dict) -> None:
             "Проверьте, что это действительно форма ИТ-расходов компании."
         )
         return
-    # Opening text: Gemini executive summary when GEMINI_API_KEY is set and the
+    # Opening text: LLM executive summary when OPENROUTER_API_KEY is set and the
     # call succeeds; otherwise the template summary — silently, never an error.
     opening = _cached_opening(entry["bytes"], _current_threshold())
     st.write(opening or workbook_summary_text(a["meta"], a["flagged_sheets"]))
@@ -570,7 +570,7 @@ def answer_question(question: str) -> str:
     reply = chat_answer(question, a["combined"], a["meta"])
     if reply is not None:
         return reply
-    # Rule-based path found nothing: try Gemini/OpenRouter text-to-SQL over
+    # Rule-based path found nothing: try LLM (OpenRouter) text-to-SQL over
     # this file's data, with recent conversation history for follow-ups like
     # "а за все года". Returns None (silently) if no key / quota / failure ->
     # not-found msg.

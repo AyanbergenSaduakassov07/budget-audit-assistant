@@ -2,7 +2,7 @@
 
 When the rule-based chat_answer() returns None, load THIS uploaded file's
 combined DataFrame into a throwaway SQLite table and route the question through
-legacy.query_engine's Gemini text-to-SQL (Russian question -> SQL grounded in a
+legacy.query_engine's LLM text-to-SQL (Russian question -> SQL grounded in a
 schema description -> SQL runs -> Russian answer phrased from ONLY the returned
 numbers). Same pattern query_engine already uses for the synthetic warehouse —
 here pointed at a per-file table instead.
@@ -424,7 +424,7 @@ def answer_over_file(
     meta: dict,
     history: list[tuple[str, str]] | None = None,
 ) -> str | None:
-    """Answer a question via Gemini text-to-SQL over the current file's data.
+    """Answer a question via LLM text-to-SQL over the current file's data.
 
     history: the last few (question, answer) text pairs from the chat, in
     order, so a follow-up like "а за все года" is understood against the
@@ -457,7 +457,7 @@ def answer_over_file(
         if not money:
             return None  # nothing numeric to query against
         flags = _split_flag_columns(combined)
-        client = _get_client()  # raises RuntimeError if GEMINI_API_KEY is unset
+        client = _get_client()  # raises RuntimeError if OPENROUTER_API_KEY is unset
     except Exception:
         return None
 

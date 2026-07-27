@@ -396,7 +396,7 @@ def answer_query(question, df, stats, meta):
 # def answer_query_llm(question, df, meta, api_key):
 #     context = df.to_csv(index=False)
 #     prompt = f"Данные бюджета:\n{context}\n\nВопрос: {question}\nОтветь кратко на русском."
-#     # call an LLM here, return response.text
+#     # call the LLM provider here, return response.text
 
 
 def chat_answer(question, combined_df, meta):

@@ -1,7 +1,7 @@
 """Tests for core.budget_narrator — deterministic logic only, no live API cost.
 
 Everything here monkeypatches _get_client/_generate_content rather than
-calling Gemini, so it runs in the free `-m "not api"` suite. A live end-to-end
+calling the live LLM, so it runs in the free `-m "not api"` suite. A live end-to-end
 check (actually calling the model) would belong under @pytest.mark.api,
 mirroring tests/test_query_engine.py's split — not added here since it wasn't
 requested and would spend real quota.
@@ -172,11 +172,11 @@ def test_narrate_audit_merges_narrative_key(monkeypatch):
 
 def test_narrate_audit_handles_client_failure_without_crashing(monkeypatch):
     def _raise_client_error():
-        raise RuntimeError("GEMINI_API_KEY environment variable is not set.")
+        raise RuntimeError("OPENROUTER_API_KEY environment variable is not set.")
 
     monkeypatch.setattr("core.budget_narrator._get_client", _raise_client_error)
 
     result = narrate_audit(_fake_audit_result())
     assert result["narrative"]["executive_summary"] == ""
     assert "error" in result["narrative"]
-    assert "GEMINI_API_KEY" in result["narrative"]["error"]
+    assert "OPENROUTER_API_KEY" in result["narrative"]["error"]

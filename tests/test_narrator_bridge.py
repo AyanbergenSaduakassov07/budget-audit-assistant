@@ -92,15 +92,15 @@ def test_adapter_survives_empty_and_missing_columns():
 
 # --- never-raises guarantee ------------------------------------------------------
 def test_narrative_opening_returns_none_without_key(quarterly_result, monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     meta, combined = quarterly_result
     assert narrative_opening(meta, combined) is None
 
 
 def test_narrative_opening_never_raises_on_garbage_input(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert narrative_opening(None, None) is None
-    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-no-network")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key-no-network")
     # With a key set, garbage input must still degrade to None, not raise —
     # build_audit_result tolerates it and the API failure is swallowed.
     import core.budget_narrator as bn
@@ -110,7 +110,7 @@ def test_narrative_opening_never_raises_on_garbage_input(monkeypatch):
 
 def test_narrative_opening_success_path(quarterly_result, monkeypatch):
     meta, combined = quarterly_result
-    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
     import core.budget_narrator as bn
     monkeypatch.setattr(bn, "_get_client", lambda: object())
     monkeypatch.setattr(bn, "_generate_content", lambda client, prompt: (
@@ -125,7 +125,7 @@ def test_narrative_opening_success_path(quarterly_result, monkeypatch):
 
 def test_narrative_opening_model_error_falls_back(quarterly_result, monkeypatch):
     meta, combined = quarterly_result
-    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
     import core.budget_narrator as bn
     monkeypatch.setattr(bn, "_get_client", lambda: object())
     monkeypatch.setattr(bn, "_generate_content", lambda client, prompt: "NOT JSON AT ALL")
