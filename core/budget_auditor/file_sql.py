@@ -222,13 +222,71 @@ def _money_line(col: str) -> str:
     return f"  - {col}    REAL   {meaning} {year} год"
 
 
+def _plan_year(combined: pd.DataFrame, meta: dict) -> int | None:
+    """Campaign/plan year: combined['plan_year'] (set row-wise by
+    aggregate_workbook) first, meta['campaign_year'] as fallback -- same
+    idiom already used by narrator_bridge.py for the same uncertainty
+    (a file may only ever populate 'Компания' and never 'Год кампании')."""
+    year = None
+    if "plan_year" in combined.columns and combined["plan_year"].notna().any():
+        year = combined["plan_year"].dropna().iloc[0]
+    elif meta.get("campaign_year") is not None:
+        year = meta.get("campaign_year")
+    if year is None or pd.isna(year):
+        return None
+    return int(year)
+
+
+def _years_in_money_cols(money: list[str]) -> set[int]:
+    years = set()
+    for col in money:
+        m = re.match(r"^(?:plan|fact|forecast)_(\d{4})(?:_q[1-4])?$", col)
+        if m:
+            years.add(int(m.group(1)))
+    return years
+
+
+def _structural_notes(combined: pd.DataFrame, meta: dict, dims: list[str], money: list[str]) -> str:
+    """Structural facts parser.py already computed and discarded before
+    reaching the LLM (Bug D / Bug C schema half): whether an earlier year
+    than the campaign year is represented at all, and whether a
+    justification/Обоснование column exists for this file. Stated only when
+    the gap actually applies -- no earlier year, or no justification column
+    -- so a normal file's schema carries neither warning."""
+    notes = []
+
+    plan_year = _plan_year(combined, meta)
+    if plan_year is not None:
+        years = _years_in_money_cols(money)
+        earlier = sorted(y for y in years if y < plan_year)
+        if not earlier:
+            notes.append(
+                f"Кампания: {plan_year} год. Более ранних лет (до {plan_year}) в "
+                "данных НЕТ — если вопрос про «прошлый год» или сравнение с "
+                "предыдущим годом, ответь, что сравнение невозможно, НЕ "
+                "подставляй более поздний год вместо более раннего."
+            )
+
+    if "justification" not in dims:
+        notes.append(
+            "В этом файле НЕТ колонки Обоснование — обоснование отсутствует "
+            "для 100% статей, это структурный пробел формы, а не результат "
+            "фильтрации."
+        )
+
+    return "\n".join(notes)
+
+
 def _schema_description(
     combined: pd.DataFrame, meta: dict, dims: list[str], money: list[str],
     flags: list[str],
 ) -> str:
     """Plain-text schema grounding the model in THIS file's table — dimensions,
-    the per-year money columns, the pre-computed anomaly flags, and the exact
-    distinct branch/cost_type values."""
+    the per-year money columns, the pre-computed anomaly flags, the exact
+    distinct branch/cost_type values, and any structural gaps (see
+    _structural_notes) — no earlier-than-campaign year, or no justification
+    column at all — that parser.py already knows and would otherwise be
+    silently discarded before reaching the LLM."""
     unit = meta.get("unit", "")
     unit_label = "тыс. тенге" if str(unit) == "1000" else (str(unit) or "единицах формы")
 
@@ -254,6 +312,7 @@ def _schema_description(
     }
     dim_block = "\n".join(dim_lines[c] for c in dims if c in dim_lines)
     flag_block = "\n".join(_FLAG_DESCRIPTIONS[c] for c in flags if c in _FLAG_DESCRIPTIONS) or "  (нет)"
+    structural_notes = _structural_notes(combined, meta, dims, money)
 
     return f"""\
 Table: {_TABLE}
@@ -284,7 +343,7 @@ Precomputed anomaly flags (уже посчитаны пайплайном ауд
 
 Точные значения cost_type:
 {cost_block}
-"""
+""" + (f"\n{structural_notes}\n" if structural_notes else "")
 
 
 def _generate_and_run_sql(

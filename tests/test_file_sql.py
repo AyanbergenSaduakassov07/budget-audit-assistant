@@ -24,6 +24,7 @@ from core.budget_auditor.file_sql import (
 )
 from legacy import warehouse
 from tests.test_budget_auditor import (
+    _full_form_workbook,
     _no_target_year_workbook,
     _run_pipeline,
     _write_headers,
@@ -130,6 +131,75 @@ def test_flag_columns_exposed_in_schema_and_filterable(tmp_path):
         assert set(df["item_name"]) == {"Критично"}
     finally:
         os.unlink(db_path)
+
+
+def _no_earlier_year_workbook(path):
+    """Campaign year 2027, plan_2027 + plan_2028 only (Bug D shape): no year
+    before the campaign year exists anywhere in the file, so "compared to
+    last year" has nothing valid to compare against. Includes an Обоснование
+    column so this test isolates the year-gap warning from the
+    justification-gap warning."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OPEX"
+    _write_meta(ws, campaign_year=2027)
+    hdr = 9
+    _write_headers(ws, hdr, {
+        9: "Контрагент", 10: "Обоснование",
+        11: "План за 2027 год", 12: "План за 2028 год",
+    })
+    r = hdr + 1
+    ws.cell(row=r, column=3, value="IT-OP-01")
+    ws.cell(row=r, column=4, value="Связь")
+    r += 1
+    ws.cell(row=r, column=7, value="Услуги связи")
+    ws.cell(row=r, column=8, value="Интернет")
+    ws.cell(row=r, column=9, value="Телеком Плюс")
+    ws.cell(row=r, column=10, value="обоснование есть")
+    ws.cell(row=r, column=11, value=5000)
+    ws.cell(row=r, column=12, value=5500)
+    ws.cell(row=r + 1, column=3, value="Итого")
+    ws.cell(row=r + 1, column=11, value=5000)
+    wb.save(path)
+    return path
+
+
+# --- structural facts (Bug D / Bug C schema half) --------------------------------
+def test_schema_states_no_earlier_year_when_none_present(tmp_path):
+    """Bug D: a file with only years >= the campaign year (e.g. 2027-2028,
+    nothing from 2025/2026) must tell the model comparison to a prior year
+    is impossible, so it doesn't substitute a later year as "last year"."""
+    _, _, _, combined = _run_pipeline(_no_earlier_year_workbook(tmp_path / "no_earlier.xlsx"))
+    dims, money = _split_columns(combined)
+    flags = _split_flag_columns(combined)
+    schema = _schema_description(combined, {"unit": 1000}, dims, money, flags)
+    assert "Более ранних лет" in schema
+    assert "сравнение невозможно" in schema.lower()
+
+
+def test_schema_states_no_justification_column_when_absent(tmp_path):
+    """Bug C schema half: a file with no Обоснование column at all must
+    state that all items lack it structurally, not as a filtering result."""
+    combined = _subsidiary_b(tmp_path)
+    dims, money = _split_columns(combined)
+    flags = _split_flag_columns(combined)
+    assert "justification" not in dims  # confirms the fixture's actual shape
+    schema = _schema_description(combined, {"unit": 1000}, dims, money, flags)
+    assert "НЕТ колонки Обоснование" in schema
+    assert "структурный пробел" in schema
+
+
+def test_schema_omits_both_warnings_when_neither_gap_applies(tmp_path):
+    """A file that DOES have both an earlier year and a justification column
+    must carry neither structural warning -- they're conditional on the gap
+    actually applying, not boilerplate always appended."""
+    _, _, _, combined = _run_pipeline(_full_form_workbook(tmp_path / "full_form.xlsx"))
+    dims, money = _split_columns(combined)
+    flags = _split_flag_columns(combined)
+    assert "justification" in dims  # confirms the fixture's actual shape
+    schema = _schema_description(combined, {"unit": 1000}, dims, money, flags)
+    assert "Более ранних лет" not in schema
+    assert "НЕТ колонки Обоснование" not in schema
 
 
 # --- graceful degradation (never raises, returns None) --------------------------
