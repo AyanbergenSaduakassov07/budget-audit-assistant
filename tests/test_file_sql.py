@@ -7,21 +7,72 @@ contract. A real end-to-end call is exercised by scripts, not here (it costs
 quota and is non-deterministic).
 """
 
+import os
+
+import openpyxl
+
 from legacy.query_engine import _SQL_EXAMPLES
 
 import core.budget_auditor.file_sql as file_sql
 from core.budget_auditor.file_sql import (
     _BUDGET_ITEMS_SQL_EXAMPLES,
+    _load_temp_db,
     _schema_description,
     _split_columns,
+    _split_flag_columns,
     answer_over_file,
 )
-from tests.test_budget_auditor import _no_target_year_workbook, _run_pipeline
+from legacy import warehouse
+from tests.test_budget_auditor import (
+    _no_target_year_workbook,
+    _run_pipeline,
+    _write_headers,
+    _write_meta,
+)
 
 
 def _subsidiary_b(tmp_path):
     _, _, _, combined = _run_pipeline(_no_target_year_workbook(tmp_path / "subb.xlsx"))
     return combined
+
+
+def _quarterly_flag_workbook(path):
+    """A quarterly OPEX sheet with three rows: a genuine critical mismatch, a
+    row whose quarterly sum is off by only floating-point noise (well under
+    the 1% tolerance and must NOT be flagged), and a clean exact-match row."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OPEX"
+    _write_meta(ws)
+    hdr = 9
+    _write_headers(ws, hdr, {
+        9: "Контрагент", 10: "Обоснование", 11: "План за 2026 год",
+        12: "1 кв 2026", 13: "2 кв 2026", 14: "3 кв 2026", 15: "4 кв 2026",
+    })
+    rows = [
+        # (item, annual, q1, q2, q3, q4)
+        ("Критично", 100_000, 23_500, 23_500, 23_500, 23_500),  # 6% off -> critical
+        # quarters sum to 100_000.00000000001 -- pure float addition noise,
+        # nowhere near the 1% tolerance -> must NOT be flagged.
+        ("Шум округления", 100_000, 25_000.000000001, 25_000, 25_000, 25_000),
+        ("Точно", 100_000, 25_000, 25_000, 25_000, 25_000),  # exact -> clean
+    ]
+    r = hdr + 1
+    ws.cell(row=r, column=3, value="IT-OP-01")
+    ws.cell(row=r, column=4, value="Услуги")
+    for item, annual, *quarters in rows:
+        r += 1
+        ws.cell(row=r, column=7, value="Услуги")
+        ws.cell(row=r, column=8, value=item)
+        ws.cell(row=r, column=9, value="Вендор")
+        ws.cell(row=r, column=10, value="обоснование есть")
+        ws.cell(row=r, column=11, value=annual)
+        for i, q in enumerate(quarters):
+            ws.cell(row=r, column=12 + i, value=q)
+    ws.cell(row=r + 1, column=3, value="Итого")
+    ws.cell(row=r + 1, column=11, value=300_000)
+    wb.save(path)
+    return path
 
 
 # --- schema / table build -------------------------------------------------------
@@ -39,7 +90,8 @@ def test_split_columns_finds_money_and_dims(tmp_path):
 def test_schema_description_grounds_the_model(tmp_path):
     combined = _subsidiary_b(tmp_path)
     dims, money = _split_columns(combined)
-    schema = _schema_description(combined, {"unit": 1000}, dims, money)
+    flags = _split_flag_columns(combined)
+    schema = _schema_description(combined, {"unit": 1000}, dims, money, flags)
     assert "budget_items" in schema
     assert "plan_2027" in schema
     assert "тыс. тенге" in schema
@@ -47,6 +99,37 @@ def test_schema_description_grounds_the_model(tmp_path):
     # few-shot examples must be present.
     assert "НЕТ единой колонки 'year'" in schema
     assert "OPEX" in schema  # exact cost_type value listed
+
+
+def test_flag_columns_exposed_in_schema_and_filterable(tmp_path):
+    """Pre-computed anomaly flags must reach the SQL layer instead of being
+    discarded: the schema text must mention quarterly_mismatch_flag (telling
+    the model to filter on it rather than recompute it), and a query filtering
+    on it must return only the genuinely flagged row — NOT the row whose
+    quarterly/annual gap is pure floating-point noise well under the 1%
+    tolerance."""
+    _, _, _, combined = _run_pipeline(_quarterly_flag_workbook(tmp_path / "quarters.xlsx"))
+
+    dims, money = _split_columns(combined)
+    flags = _split_flag_columns(combined)
+    assert "quarterly_mismatch_flag" in flags
+    assert "quarterly_severity" in flags
+    assert "quarterly_gap_pct" in flags
+
+    schema = _schema_description(combined, {"unit": 1000}, dims, money, flags)
+    assert "quarterly_mismatch_flag" in schema
+    assert "quarterly_severity" in schema
+    assert "не пересчитывайте" in schema.lower()
+
+    db_path = _load_temp_db(combined, dims, money, flags)
+    try:
+        df = warehouse.run_sql(
+            "SELECT item_name FROM budget_items WHERE quarterly_mismatch_flag = 1",
+            db_path,
+        )
+        assert set(df["item_name"]) == {"Критично"}
+    finally:
+        os.unlink(db_path)
 
 
 # --- graceful degradation (never raises, returns None) --------------------------

@@ -58,9 +58,7 @@ _TABLE = "budget_items"
 # plan_2027 / fact_2025 / forecast_2028 / plan_2027_q1 — the money columns.
 _MONEY_RE = re.compile(r"^(plan|fact|forecast)_\d{4}(_q[1-4])?$")
 
-# Descriptive dimensions worth exposing to the SQL layer (flags, per-row deltas,
-# and helper columns are intentionally left out — the model reasons over raw
-# amounts, the same discipline as the synthetic warehouse's schema).
+# Descriptive dimensions worth exposing to the SQL layer.
 _DIM_COLS = [
     "branch", "cost_type", "statya_code", "statya_name",
     "item_name", "category", "subcategory", "counterparty", "justification",
@@ -70,6 +68,71 @@ _MONEY_MEANING = {
     "plan": "утверждённый план на",
     "fact": "факт за",
     "forecast": "прогноз на",
+}
+
+# Pre-computed anomaly/severity columns from core.budget_auditor.parser's
+# flag_rows()/_flag_quarterly(). These ARE exposed to the SQL layer (unlike
+# other helper columns) precisely because they are the authoritative already-
+# computed answer to "is this row anomalous" questions — re-deriving them from
+# raw plan_<year>/plan_<year>_qN columns has been shown to produce a
+# materially wrong result (e.g. counting floating-point noise below the 1%
+# tolerance as a "discrepancy"). The schema text tells the model to filter on
+# these columns, not recompute the underlying condition.
+_FLAG_COLS = [
+    "quarterly_mismatch_flag", "quarterly_severity", "quarterly_gap_pct",
+    "high_change_flag", "delta_pct",
+    "missing_justification_flag", "high_price_flag",
+]
+
+# quarterly_mismatch_flag/high_change_flag/missing_justification_flag/
+# high_price_flag are plain bool Series (never NA) from parser.py — cast
+# straight to SQLite INTEGER 0/1. quarterly_gap_pct/delta_pct are float
+# percentages (NA where not applicable) — REAL, same as money columns.
+# quarterly_severity is a 'critical'/'minor'/NA string — TEXT, same as dims.
+_FLAG_BOOL_COLS = {
+    "quarterly_mismatch_flag", "high_change_flag",
+    "missing_justification_flag", "high_price_flag",
+}
+_FLAG_NUMERIC_COLS = {"quarterly_gap_pct", "delta_pct"}
+
+_FLAG_DESCRIPTIONS = {
+    "quarterly_mismatch_flag": (
+        "  - quarterly_mismatch_flag    INTEGER (0/1)   1 значит, что сумма "
+        "плановых кварталов (plan_<год>_q1..q4) этой строки расходится с "
+        "годовым планом (plan_<год>) больше чем на 1%. Уже посчитано — "
+        "фильтруйте по этой колонке, НЕ пересчитывайте сами суммированием "
+        "plan_<год>_qN."
+    ),
+    "quarterly_severity": (
+        "  - quarterly_severity         TEXT ('critical'/'minor'/NULL)   "
+        "'critical' — расхождение больше 5%; 'minor' — от 1% до 5%; NULL — "
+        "расхождения нет или кварталы неполные. Уже посчитано."
+    ),
+    "quarterly_gap_pct": (
+        "  - quarterly_gap_pct          REAL   |годовой план − сумма "
+        "кварталов| / годовой план * 100 (в процентах). Уже посчитано — "
+        "используйте это значение, не пересчитывайте."
+    ),
+    "high_change_flag": (
+        "  - high_change_flag           INTEGER (0/1)   1 значит, что "
+        "изменение плана к предыдущему году (delta_pct) по модулю больше "
+        "15%. Уже посчитано."
+    ),
+    "delta_pct": (
+        "  - delta_pct                  REAL   изменение плана к базовому "
+        "(предыдущему) году, в процентах: (план − база) / база * 100. Уже "
+        "посчитано."
+    ),
+    "missing_justification_flag": (
+        "  - missing_justification_flag INTEGER (0/1)   1 значит, что для "
+        "этой строки отсутствует обоснование расхода (justification). Уже "
+        "посчитано."
+    ),
+    "high_price_flag": (
+        "  - high_price_flag            INTEGER (0/1)   1 значит, что план "
+        "этой строки входит в верхние 10% (90-й перцентиль) по сумме плана "
+        "среди строк своего листа. Уже посчитано."
+    ),
 }
 
 # Few-shot examples grounded in THIS module's real `budget_items` schema
@@ -99,6 +162,11 @@ _BUDGET_ITEMS_SQL_EXAMPLES = [
         "SELECT SUM(fact_2027) FROM budget_items "
         "WHERE counterparty = 'ТОО Прогресс'",
     ),
+    (
+        "Есть ли расхождения по кварталам?",
+        "SELECT branch, cost_type, statya_code, item_name, quarterly_gap_pct, "
+        "quarterly_severity FROM budget_items WHERE quarterly_mismatch_flag = 1",
+    ),
 ]
 
 
@@ -108,14 +176,29 @@ def _split_columns(combined: pd.DataFrame) -> tuple[list[str], list[str]]:
     return dims, money
 
 
-def _load_temp_db(combined: pd.DataFrame, dims: list[str], money: list[str]) -> str:
+def _split_flag_columns(combined: pd.DataFrame) -> list[str]:
+    return [c for c in _FLAG_COLS if c in combined.columns]
+
+
+def _load_temp_db(
+    combined: pd.DataFrame, dims: list[str], money: list[str], flags: list[str],
+) -> str:
     """Write the selected columns into a fresh temp-file SQLite table; return
-    its path. Money columns become REAL, dimensions TEXT."""
-    frame = combined[dims + money].copy()
+    its path. Money columns become REAL, dimensions TEXT, and pre-computed
+    flag columns keep the type appropriate to their SQL role (see
+    _FLAG_BOOL_COLS/_FLAG_NUMERIC_COLS above; quarterly_severity is TEXT)."""
+    frame = combined[dims + money + flags].copy()
     for c in money:
         frame[c] = pd.to_numeric(frame[c], errors="coerce")
     for c in dims:
         frame[c] = frame[c].astype("string")
+    for c in flags:
+        if c in _FLAG_BOOL_COLS:
+            frame[c] = frame[c].astype(int)
+        elif c in _FLAG_NUMERIC_COLS:
+            frame[c] = pd.to_numeric(frame[c], errors="coerce")
+        else:
+            frame[c] = frame[c].astype("string")
 
     fd, path = tempfile.mkstemp(suffix=".db", prefix="filesql_")
     os.close(fd)
@@ -139,9 +222,13 @@ def _money_line(col: str) -> str:
     return f"  - {col}    REAL   {meaning} {year} год"
 
 
-def _schema_description(combined: pd.DataFrame, meta: dict, dims: list[str], money: list[str]) -> str:
+def _schema_description(
+    combined: pd.DataFrame, meta: dict, dims: list[str], money: list[str],
+    flags: list[str],
+) -> str:
     """Plain-text schema grounding the model in THIS file's table — dimensions,
-    the per-year money columns, and the exact distinct branch/cost_type values."""
+    the per-year money columns, the pre-computed anomaly flags, and the exact
+    distinct branch/cost_type values."""
     unit = meta.get("unit", "")
     unit_label = "тыс. тенге" if str(unit) == "1000" else (str(unit) or "единицах формы")
 
@@ -166,6 +253,7 @@ def _schema_description(combined: pd.DataFrame, meta: dict, dims: list[str], mon
         "justification": "  - justification TEXT   обоснование расхода (может быть пустым)",
     }
     dim_block = "\n".join(dim_lines[c] for c in dims if c in dim_lines)
+    flag_block = "\n".join(_FLAG_DESCRIPTIONS[c] for c in flags if c in _FLAG_DESCRIPTIONS) or "  (нет)"
 
     return f"""\
 Table: {_TABLE}
@@ -177,6 +265,10 @@ Dimension columns (TEXT):
 
 Money columns (REAL, суммы в {unit_label}):
 {money_block}
+
+Precomputed anomaly flags (уже посчитаны пайплайном аудита — фильтруйте по
+ним напрямую, НЕ пересчитывайте условие самостоятельно из money-колонок):
+{flag_block}
 
 ВАЖНО про структуру:
 - В таблице НЕТ единой колонки 'year' и НЕТ колонки 'subtotal'/'amount'. Сумма за
@@ -305,14 +397,15 @@ def answer_over_file(
         dims, money = _split_columns(combined)
         if not money:
             return None  # nothing numeric to query against
+        flags = _split_flag_columns(combined)
         client = _get_client()  # raises RuntimeError if GEMINI_API_KEY is unset
     except Exception:
         return None
 
     db_path = None
     try:
-        db_path = _load_temp_db(combined, dims, money)
-        schema = _schema_description(combined, meta or {}, dims, money)
+        db_path = _load_temp_db(combined, dims, money, flags)
+        schema = _schema_description(combined, meta or {}, dims, money, flags)
 
         classification = "simple"
         try:
