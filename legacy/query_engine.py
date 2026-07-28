@@ -274,13 +274,14 @@ def synthesize_answer(
         "русском на исходный вопрос. Используй ТОЛЬКО числа из результатов "
         "ниже — ничего не выдумывай. Суммы в тенге (KZT). "
         + _NUMBER_FORMAT_INSTRUCTION
+        + " " + _FORMATTING_INSTRUCTION
         + "\n\n"
         f"{_format_history(history)}"
         f"Исходный вопрос: {original_question}\n\n"
         f"{blocks}\n\n"
         "Итоговый ответ:"
     )
-    return _generate_content(client, prompt).strip()
+    return _strip_decorative_chars(_generate_content(client, prompt).strip())
 
 
 # SQL result frames can hold very large sums (e.g. workbook-wide totals in
@@ -294,6 +295,48 @@ _NUMBER_FORMAT_INSTRUCTION = (
     "по три цифры, например 155 903 400 000), а НЕ в экспоненциальной записи "
     "(никогда не пиши вида 1.5e+11)."
 )
+
+# Shared across every LLM-generated user-facing Russian text in this codebase
+# (this module's _phrase_answer/synthesize_answer, and
+# core.budget_narrator._build_prompt, which imports this constant): a
+# generated business/audit document must read like one, not like chat output.
+# Stated as an explicit line on every prompt rather than assumed from context —
+# a model that isn't told not to decorate its answer sometimes does.
+_FORMATTING_INSTRUCTION = (
+    "Пиши официальным деловым языком, без эмодзи и любых декоративных "
+    "символов, без markdown-разметки (никаких **, *, -, # для форматирования) "
+    "— обычным связным текстом, как в официальном документе."
+)
+
+# Second line of defense: strip decorative characters a model produced anyway,
+# despite _FORMATTING_INSTRUCTION. Covers the two emoji blocks most commonly
+# seen in LLM output (misc symbols/pictographs, misc symbols & dingbats) plus
+# the invisible modifiers that ride along with them (variation selector-16,
+# zero-width joiner) so removing an emoji doesn't leave an orphaned modifier
+# behind.
+_EMOJI_RE = re.compile(
+    "[" "\U0001f300-\U0001faff" "\U00002600-\U000027bf" "\U0000fe0f" "\U0000200d" "]",
+    flags=re.UNICODE,
+)
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_ITALIC_STAR_RE = re.compile(r"(?<!\w)\*(.+?)\*(?!\w)")
+_MD_ITALIC_UNDERSCORE_RE = re.compile(r"(?<!\w)_(.+?)_(?!\w)")
+_MD_BULLET_RE = re.compile(r"^[ \t]*[-*][ \t]+")
+
+
+def _strip_decorative_chars(text: str) -> str:
+    """Plain running text: emoji and markdown bold/italic/bullet markers
+    removed. A model that ignores _FORMATTING_INSTRUCTION still can't leak
+    decoration into a document meant to read as an official conclusion."""
+    if not text:
+        return text
+    cleaned = _EMOJI_RE.sub("", text)
+    cleaned = _MD_BOLD_RE.sub(r"\1", cleaned)
+    cleaned = _MD_ITALIC_STAR_RE.sub(r"\1", cleaned)
+    cleaned = _MD_ITALIC_UNDERSCORE_RE.sub(r"\1", cleaned)
+    cleaned = "\n".join(_MD_BULLET_RE.sub("", line) for line in cleaned.splitlines())
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
 
 
 def _phrase_answer(
@@ -324,10 +367,10 @@ def _phrase_answer(
         f"Вопрос пользователя: {question}\n\n"
         f"Выполненный SQL:\n{sql}\n\n"
         f"Результат запроса:\n{result_text}\n\n"
-        f"{data_instruction}"
+        f"{data_instruction} {_FORMATTING_INSTRUCTION}"
     )
 
-    return _generate_content(client, prompt).strip()
+    return _strip_decorative_chars(_generate_content(client, prompt).strip())
 
 
 def answer(question: str, db_path: str = "procurement.db") -> dict:

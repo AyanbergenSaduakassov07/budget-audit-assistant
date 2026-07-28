@@ -14,7 +14,9 @@ from legacy.query_engine import (
     _format_history,
     _generate_sql,
     _phrase_answer,
+    _strip_decorative_chars,
     answer,
+    synthesize_answer,
 )
 
 
@@ -113,6 +115,95 @@ def test_format_history_caps_to_last_three_turns():
         assert f"вопрос {i}" not in block
     for i in (3, 4, 5):
         assert f"вопрос {i}" in block
+
+
+# --- decorative-character stripping (regression) ---------------------------------
+# Both the prompt instruction and this post-processing are defense in depth:
+# a model that decorates its answer despite being told not to must still come
+# back as plain business-register text.
+def test_strip_decorative_chars_removes_emoji_and_markdown():
+    raw = "📊 Бюджет вырос на **15%** к прошлому году ✅\n- пункт списка\n* второй пункт"
+    cleaned = _strip_decorative_chars(raw)
+    assert "📊" not in cleaned and "✅" not in cleaned
+    assert "**" not in cleaned and "15%" in cleaned
+    assert "- пункт" not in cleaned and "пункт списка" in cleaned
+    assert "* второй" not in cleaned and "второй пункт" in cleaned
+
+
+def test_strip_decorative_chars_leaves_clean_text_unchanged():
+    clean = "Бюджет вырос на 15% к прошлому году, что требует уточнения."
+    assert _strip_decorative_chars(clean) == clean
+    # Underscores inside identifiers and a literal multiplication sign must
+    # survive -- the stripping regex must not treat every _/* as a marker pair.
+    assert _strip_decorative_chars("plan_annual остаётся без изменений") == "plan_annual остаётся без изменений"
+    assert _strip_decorative_chars("5 * 3 = 15, не искажать") == "5 * 3 = 15, не искажать"
+
+
+def test_phrase_answer_strips_decorative_chars_from_response():
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            return "📊 Общая сумма: **155 903 400 000** тенге ✅"
+
+        def generate_sql(self, prompt):
+            return ""
+
+    result = _phrase_answer(
+        _FakeProvider(),
+        "Какая общая сумма закупок за все годы?",
+        "SELECT SUM(subtotal) FROM procurements",
+        "155903400000",
+        empty=False,
+    )
+    assert result == "Общая сумма: 155 903 400 000 тенге"
+
+
+def test_phrase_answer_prompt_includes_formatting_instruction():
+    captured = {}
+
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            captured["prompt"] = prompt
+            return "155 903 400 000 тенге"
+
+        def generate_sql(self, prompt):
+            return ""
+
+    _phrase_answer(
+        _FakeProvider(), "Сколько всего?", "SELECT 1", "(пустой результат)", empty=True,
+    )
+    assert "без эмодзи" in captured["prompt"]
+    assert "markdown" in captured["prompt"]
+
+
+def test_synthesize_answer_strips_decorative_chars_from_response():
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            return "🔥 Итого: **500 000** тенге\n- готово"
+
+        def generate_sql(self, prompt):
+            return ""
+
+    result = synthesize_answer(
+        _FakeProvider(),
+        "Сравни расходы по двум категориям.",
+        [("Сколько на A?", "SELECT 1", "300000"), ("Сколько на B?", "SELECT 1", "200000")],
+    )
+    assert result == "Итого: 500 000 тенге\nготово"
+
+
+def test_synthesize_answer_prompt_includes_formatting_instruction():
+    captured = {}
+
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            captured["prompt"] = prompt
+            return "500 000 тенге"
+
+        def generate_sql(self, prompt):
+            return ""
+
+    synthesize_answer(_FakeProvider(), "Вопрос", [("Подвопрос", "SELECT 1", "500000")])
+    assert "без эмодзи" in captured["prompt"]
 
 
 def test_warehouse_totals_match_dataframe():

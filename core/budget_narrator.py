@@ -21,7 +21,13 @@ import math
 
 import pandas as pd
 
-from legacy.query_engine import DailyQuotaExhausted, _generate_content, _get_client
+from legacy.query_engine import (
+    DailyQuotaExhausted,
+    _FORMATTING_INSTRUCTION,
+    _generate_content,
+    _get_client,
+    _strip_decorative_chars,
+)
 
 _TOP_GROWTH_ITEMS = 5
 
@@ -109,6 +115,8 @@ def _build_prompt(context: dict) -> str:
         "сырых построчных сумм). Составь краткое заключение на русском языке "
         "строго на основе этих данных — ничего не выдумывай сверх того, что дано.\n\n"
         f"Данные аудита:\n{context_json}\n\n"
+        f"{_FORMATTING_INSTRUCTION} Это касается каждого текстового поля ниже "
+        "(executive_summary, reason, key_risks, note_on_prior_year).\n\n"
         "Верни ТОЛЬКО валидный JSON без markdown-ограждений (без ```), "
         "без пояснений до или после, в точности такой структуры:\n"
         f"{_RESPONSE_SCHEMA}"
@@ -128,6 +136,25 @@ def _strip_json_fences(text: str) -> str:
     return cleaned.strip()
 
 
+def _sanitize_narrative(narrative: dict) -> dict:
+    """Second line of defense (see _strip_decorative_chars): strip emoji and
+    markdown decoration from every user-facing text field the model can fill
+    in, even though the prompt already tells it not to. risk_level is a
+    categorical value, not free text, so it's left untouched."""
+    narrative = dict(narrative)
+    narrative["executive_summary"] = _strip_decorative_chars(narrative.get("executive_summary") or "")
+    narrative["note_on_prior_year"] = _strip_decorative_chars(narrative.get("note_on_prior_year") or "")
+    narrative["key_risks"] = [_strip_decorative_chars(r) for r in narrative.get("key_risks") or []]
+    for key in ("atk_items", "clarification_items"):
+        items = narrative.get(key) or []
+        narrative[key] = [
+            {**item, "reason": _strip_decorative_chars(item.get("reason") or "")}
+            if isinstance(item, dict) else item
+            for item in items
+        ]
+    return narrative
+
+
 def _parse_narrative(raw_text: str) -> dict:
     """Parse the model's JSON response; never raise on malformed output."""
     cleaned = _strip_json_fences(raw_text)
@@ -145,7 +172,7 @@ def _parse_narrative(raw_text: str) -> dict:
             "error": "Ответ модели не является JSON-объектом.",
         }
 
-    return {**_FALLBACK_NARRATIVE, **parsed}
+    return _sanitize_narrative({**_FALLBACK_NARRATIVE, **parsed})
 
 
 def narrate_audit(audit_result: dict) -> dict:

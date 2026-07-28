@@ -147,6 +147,57 @@ def test_parse_narrative_non_object_json_returns_fallback():
     assert parsed["key_risks"] == []
 
 
+# --- decorative-character stripping (regression) ----------------------------------
+# _build_prompt tells the model not to decorate its Russian text; this is the
+# second line of defense for when it does anyway (see legacy.query_engine's
+# _strip_decorative_chars, shared by this module).
+def test_parse_narrative_strips_decorative_chars_from_all_text_fields():
+    raw = json.dumps({
+        "executive_summary": "📊 Три статьи требуют **АТК** ✅",
+        "atk_items": [{"supplier": "ТОО Мегасервис", "reason": "- рост цен 🔥", "amount_tys_tg": 198326.0}],
+        "clarification_items": [{"supplier": "ТОО Тест", "reason": "* нет обоснования"}],
+        "risk_level": "высокий",
+        "key_risks": ["🔥 концентрация поставщика", "**системный риск**"],
+        "note_on_prior_year": "- сравнение доступно ✅",
+    }, ensure_ascii=False)
+
+    parsed = _parse_narrative(raw)
+
+    assert parsed["executive_summary"] == "Три статьи требуют АТК"
+    assert parsed["atk_items"][0]["reason"] == "рост цен"
+    assert parsed["atk_items"][0]["supplier"] == "ТОО Мегасервис"  # untouched
+    assert parsed["clarification_items"][0]["reason"] == "нет обоснования"
+    assert parsed["key_risks"] == ["концентрация поставщика", "системный риск"]
+    assert parsed["note_on_prior_year"] == "сравнение доступно"
+    assert parsed["risk_level"] == "высокий"  # categorical field, left untouched
+
+
+def test_parse_narrative_leaves_clean_response_unchanged():
+    raw = json.dumps({
+        "executive_summary": "Бюджет вырос на 15% к прошлому году.",
+        "atk_items": [{"supplier": "ТОО Тест", "reason": "рост цен", "amount_tys_tg": 100000.0}],
+        "clarification_items": [],
+        "risk_level": "средний",
+        "key_risks": ["концентрация поставщика"],
+        "note_on_prior_year": "Сравнение доступно.",
+    }, ensure_ascii=False)
+
+    parsed = _parse_narrative(raw)
+
+    assert parsed["executive_summary"] == "Бюджет вырос на 15% к прошлому году."
+    assert parsed["atk_items"][0]["reason"] == "рост цен"
+    assert parsed["key_risks"] == ["концентрация поставщика"]
+    assert parsed["note_on_prior_year"] == "Сравнение доступно."
+
+
+def test_build_prompt_includes_formatting_instruction():
+    from core.budget_narrator import _build_prompt
+
+    prompt = _build_prompt(_build_context(_fake_audit_result()))
+    assert "без эмодзи" in prompt
+    assert "markdown" in prompt
+
+
 # --- narrate_audit: full flow, API mocked out ---------------------------------------
 def test_narrate_audit_merges_narrative_key(monkeypatch):
     canned_response = json.dumps({
