@@ -677,5 +677,8 @@ if submitted:
                         "bytes": f.getvalue(), "uid": uuid.uuid4().hex})
     if text:
         history.append({"role": "user", "content": text})
-        history.append({"role": "assistant", "content": answer_question(text)})
+        with st.chat_message("assistant"):
+            with st.spinner("Обрабатываю запрос..."):
+                reply = answer_question(text)
+        history.append({"role": "assistant", "content": reply})
     st.rerun()
