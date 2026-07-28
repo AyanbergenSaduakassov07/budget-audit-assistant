@@ -5,6 +5,8 @@ two tests that hit it are marked `@pytest.mark.api` and can be deselected with
 `-m "not api"`. The warehouse-only test runs for free and needs no marker.
 """
 
+import json
+
 import pytest
 
 from legacy.synth import generate_group
@@ -16,6 +18,8 @@ from legacy.query_engine import (
     _phrase_answer,
     _strip_decorative_chars,
     answer,
+    next_step,
+    self_check_answer,
     synthesize_answer,
 )
 
@@ -204,6 +208,104 @@ def test_synthesize_answer_prompt_includes_formatting_instruction():
 
     synthesize_answer(_FakeProvider(), "Вопрос", [("Подвопрос", "SELECT 1", "500000")])
     assert "без эмодзи" in captured["prompt"]
+
+
+# --- next_step() / self_check_answer(): the bounded step loop's primitives ------
+def test_next_step_parses_query_action():
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            return json.dumps({
+                "action": "query", "sql": "SELECT SUM(plan_2027) FROM budget_items",
+                "reason": "узнать план",
+            })
+
+    step = next_step(_FakeProvider(), "Вопрос", "Table: budget_items", scratchpad=[])
+    assert step == {
+        "action": "query",
+        "sql": "SELECT SUM(plan_2027) FROM budget_items",
+        "reason": "узнать план",
+    }
+
+
+def test_next_step_final_action_strips_decorative_chars():
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            return json.dumps({"action": "final", "answer": "📊 Итог: **9 800** тенге ✅"})
+
+    step = next_step(_FakeProvider(), "Вопрос", "Table: budget_items", scratchpad=[])
+    assert step == {"action": "final", "answer": "Итог: 9 800 тенге"}
+
+
+def test_next_step_malformed_or_empty_response_returns_error_action():
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            return "not json at all"
+
+    assert next_step(_FakeProvider(), "Вопрос", "Table: t", scratchpad=[]) == {"action": "error"}
+
+    class _EmptyAnswerProvider:
+        def generate_json(self, prompt):
+            return json.dumps({"action": "final", "answer": "   "})
+
+    assert next_step(_EmptyAnswerProvider(), "Вопрос", "Table: t", scratchpad=[]) == {"action": "error"}
+
+    class _EmptySqlProvider:
+        def generate_json(self, prompt):
+            return json.dumps({"action": "query", "sql": "", "reason": "..."})
+
+    assert next_step(_EmptySqlProvider(), "Вопрос", "Table: t", scratchpad=[]) == {"action": "error"}
+
+
+def test_next_step_prompt_requires_a_query_when_scratchpad_empty_not_when_populated():
+    captured = {}
+
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            captured["prompt"] = prompt
+            return json.dumps({"action": "final", "answer": "Итог."})
+
+    next_step(_FakeProvider(), "Вопрос", "Table: t", scratchpad=[])
+    assert "ОБЯЗАТЕЛЬНО нужно" in captured["prompt"]
+
+    next_step(_FakeProvider(), "Вопрос", "Table: t",
+              scratchpad=[{"sql": "SELECT 1", "result": "1", "reason": "проверка"}])
+    assert "ОБЯЗАТЕЛЬНО нужно" not in captured["prompt"]
+    assert "Уже выполненные шаги" in captured["prompt"]
+    assert "проверка" in captured["prompt"]
+
+
+def test_next_step_prompt_includes_formatting_instruction():
+    captured = {}
+
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            captured["prompt"] = prompt
+            return json.dumps({"action": "final", "answer": "Итог."})
+
+    next_step(_FakeProvider(), "Вопрос", "Table: t", scratchpad=[])
+    assert "без эмодзи" in captured["prompt"]
+    assert "markdown" in captured["prompt"]
+
+
+def test_self_check_answer_parses_complete_and_missing():
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            return json.dumps({"complete": False, "missing": "не хватает данных за 2025 год"})
+
+    result = self_check_answer(_FakeProvider(), "Вопрос", "Черновой ответ")
+    assert result == {"complete": False, "missing": "не хватает данных за 2025 год"}
+
+
+def test_self_check_answer_malformed_response_defaults_to_complete():
+    """A self-check failure must never block the answer -- degrade to
+    "ship the draft as-is", not raise or force an extra step."""
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            return "garbage, not json"
+
+    assert self_check_answer(_FakeProvider(), "Вопрос", "Черновой ответ") == {
+        "complete": True, "missing": "",
+    }
 
 
 def test_warehouse_totals_match_dataframe():

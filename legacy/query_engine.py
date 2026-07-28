@@ -10,13 +10,19 @@ OpenRouter (openai SDK) when OPENROUTER_API_KEY is set — the only provider
 this codebase supports. See llm_providers.py for the provider interface and
 the retry/backoff + DailyQuotaExhausted contract.
 
+next_step()/self_check_answer() are schema-agnostic building blocks for a
+bounded step loop (propose one SQL query + a reason, or finalize, given
+everything queried so far in this same answer) — used by
+core.budget_auditor.file_sql.answer_over_file() so the model can react to
+what an early query reveals instead of planning every query up front.
+
 Per SPEC.md architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Literal
 
 from legacy import warehouse
 from legacy.llm_providers import DailyQuotaExhausted, LLMProvider, get_provider
@@ -176,81 +182,6 @@ def _generate_sql_with_error_feedback(
     return _strip_sql_fences(client.generate_sql(prompt))
 
 
-def classify_question(
-    client: LLMProvider,
-    question: str,
-    schema_description: str,
-) -> Literal["simple", "compound"]:
-    """Cheap classification: can `question` be answered by ONE aggregation/
-    filter query, or does it require combining results from more than one
-    independent query (e.g. an "и"/"или"/comparative clause spanning two
-    different aggregations that can't be expressed as a single GROUP BY)?
-
-    A single short client.generate_json() call — same retry/backoff and
-    DailyQuotaExhausted contract as every other provider call in this module.
-    Parsing defaults to "simple" unless the model's answer clearly says
-    "compound", so a garbled response degrades to the cheaper, safer path.
-    """
-    prompt = (
-        "Ты классифицируешь вопросы к базе данных закупок компании (SQLite). "
-        "Определи: можно ли ответить на вопрос ОДНИМ SQL-запросом с одной "
-        "агрегацией/фильтром (simple), или вопрос составной и требует "
-        "объединения результатов НЕСКОЛЬКИХ независимых запросов — например, "
-        "содержит 'и'/'или'/сравнение между двумя разными агрегациями или "
-        "категориями, которые нельзя выразить одним GROUP BY (compound).\n\n"
-        f"{schema_description}\n"
-        f"Вопрос: {question}\n\n"
-        "Ответь ОДНИМ словом, без пояснений: simple или compound."
-    )
-    raw = client.generate_json(prompt).strip().lower()
-    return "compound" if "compound" in raw else "simple"
-
-
-_NUMBERED_LINE_RE = re.compile(r"^\s*\d+[.\):]\s*(.+?)\s*$")
-
-
-def _parse_numbered_list(text: str) -> list[str]:
-    """Extract items from a "1. ...\\n2. ..." style plain-text list."""
-    items = []
-    for line in text.splitlines():
-        m = _NUMBERED_LINE_RE.match(line)
-        if m:
-            item = m.group(1).strip()
-            if item:
-                items.append(item)
-    return items
-
-
-def decompose_question(
-    client: LLMProvider,
-    question: str,
-    schema_description: str,
-    history: list[tuple[str, str]] | None = None,
-) -> list[str]:
-    """Split a compound Russian question into 2-4 self-contained sub-questions
-    whose answers, taken together, answer the original question.
-
-    Returns plain-text sub-questions only — no SQL yet; each is run through
-    the same single-question SQL-generation + execute path as a simple
-    question. Capping at 4 (even if the model returns more) is the caller's
-    responsibility (see core.budget_auditor.file_sql._answer_compound).
-    """
-    prompt = (
-        "Раздели составной вопрос на 2-4 самостоятельных подвопроса, каждый "
-        "из которых можно закрыть ОДНИМ SQL-запросом с одной агрегацией или "
-        "фильтром. Ответы на все подвопросы вместе должны полностью отвечать "
-        "на исходный вопрос.\n\n"
-        f"{schema_description}\n"
-        f"{_format_history(history)}"
-        f"Исходный вопрос: {question}\n\n"
-        "Выведи ТОЛЬКО пронумерованный список подвопросов на русском, без SQL "
-        "и без пояснений, например:\n"
-        "1. ...\n2. ..."
-    )
-    raw = _generate_content(client, prompt)
-    return _parse_numbered_list(raw)
-
-
 def synthesize_answer(
     client: LLMProvider,
     original_question: str,
@@ -337,6 +268,154 @@ def _strip_decorative_chars(text: str) -> str:
     cleaned = "\n".join(_MD_BULLET_RE.sub("", line) for line in cleaned.splitlines())
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned.strip()
+
+
+# --- bounded step loop (propose-a-query-or-finalize, given prior steps) -----------
+def _format_scratchpad(scratchpad: list[dict]) -> str:
+    """Prior {sql, result, reason} steps from THIS SAME answer, as a labeled
+    prompt block -- '' when nothing has been queried yet (step 1), so the
+    prompt doesn't carry an empty "Уже выполненные шаги:" header."""
+    if not scratchpad:
+        return ""
+    blocks = "\n\n".join(
+        f"Шаг {i}: {entry.get('reason') or '(причина не указана)'}\n"
+        f"SQL: {entry['sql']}\nРезультат:\n{entry['result']}"
+        for i, entry in enumerate(scratchpad, start=1)
+    )
+    return f"Уже выполненные шаги в этом ответе:\n\n{blocks}\n\n"
+
+
+def _parse_step_response(raw_text: str) -> dict | None:
+    """Parse a next_step()/self_check_answer() JSON response; None (never
+    raise) on anything malformed, so the caller can stop looping / fall back
+    rather than crash on garbage. _strip_sql_fences is a generic ``` fence
+    stripper despite its name -- reused here rather than a second copy."""
+    cleaned = _strip_sql_fences(raw_text)
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _build_step_prompt(
+    question: str,
+    schema_description: str,
+    scratchpad: list[dict],
+    history: list[tuple[str, str]] | None,
+    examples: list[tuple[str, str]] | None,
+) -> str:
+    if examples is None:
+        examples = _SQL_EXAMPLES
+    example_block = "\n\n".join(f"Вопрос: {q}\nSQL: {sql}" for q, sql in examples)
+    must_query_note = (
+        "Выше нет ни одного выполненного шага — тебе ОБЯЗАТЕЛЬНО нужно "
+        "сначала выполнить хотя бы один SQL-запрос; финальный ответ без "
+        "единого запроса недопустим.\n\n"
+        if not scratchpad else ""
+    )
+    return (
+        "Ты аналитик по закупкам компании. Отвечаешь на вопрос пользователя, "
+        "выполняя SQL-запросы к базе данных (SQLite) по одному за раз. На "
+        "каждом шаге у тебя есть результаты всех предыдущих запросов этого "
+        "же ответа — используй их: если для следующего запроса нужно "
+        "значение из предыдущего результата (например, сначала найти нужное "
+        "подразделение, затем проверить что-то по нему), подставь это "
+        "значение напрямую, а не выдумывай его.\n\n"
+        f"{schema_description}\n"
+        "Примеры вопросов и SQL:\n"
+        f"{example_block}\n\n"
+        f"{_format_history(history)}"
+        f"Исходный вопрос: {question}\n\n"
+        f"{_format_scratchpad(scratchpad)}"
+        f"{must_query_note}"
+        "Реши: нужен ли ещё один SQL-запрос, или данных выше уже достаточно "
+        "для ПОЛНОГО ответа на исходный вопрос (проверь, что покрыты ВСЕ его "
+        "части).\n\n"
+        "Если нужен ещё запрос — верни его вместе с краткой причиной. Если "
+        "данных уже достаточно — дай итоговый ответ на русском, кратко, "
+        "указав конкретные числа. Используй ТОЛЬКО числа из результатов "
+        "запросов выше — ничего не выдумывай. Суммы в тенге (KZT). "
+        + _NUMBER_FORMAT_INSTRUCTION + " " + _FORMATTING_INSTRUCTION + "\n\n"
+        "Верни ТОЛЬКО валидный JSON без markdown-ограждений (без ```), без "
+        "пояснений до или после, ОДНОЙ из двух структур:\n"
+        '{"action": "query", "sql": "<один SQLite SELECT>", '
+        '"reason": "<кратко, зачем этот запрос>"}\n'
+        '{"action": "final", "answer": "<итоговый ответ на русском>"}'
+    )
+
+
+def next_step(
+    client: LLMProvider,
+    question: str,
+    schema_description: str,
+    scratchpad: list[dict],
+    history: list[tuple[str, str]] | None = None,
+    examples: list[tuple[str, str]] | None = None,
+) -> dict:
+    """One step of the bounded step loop used by
+    core.budget_auditor.file_sql.answer_over_file(): given everything
+    queried so far in THIS answer (scratchpad, a list of {sql, result,
+    reason} dicts), ask the model to either propose one more SQL query (with
+    a short reason) or give a final Russian answer.
+
+    Returns one of:
+      {"action": "query", "sql": str, "reason": str}
+      {"action": "final", "answer": str}
+      {"action": "error"}   -- malformed/empty response; caller stops
+                               looping and falls back to forced synthesis.
+    Never raises.
+    """
+    prompt = _build_step_prompt(question, schema_description, scratchpad, history, examples)
+    parsed = _parse_step_response(_generate_content(client, prompt))
+    if parsed is None:
+        return {"action": "error"}
+
+    action = parsed.get("action")
+    if action == "final":
+        answer_text = parsed.get("answer")
+        if not isinstance(answer_text, str) or not answer_text.strip():
+            return {"action": "error"}
+        return {"action": "final", "answer": _strip_decorative_chars(answer_text.strip())}
+    if action == "query":
+        sql = parsed.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            return {"action": "error"}
+        reason = parsed.get("reason")
+        return {
+            "action": "query",
+            "sql": _strip_sql_fences(sql.strip()),
+            "reason": reason.strip() if isinstance(reason, str) else "",
+        }
+    return {"action": "error"}
+
+
+def self_check_answer(client: LLMProvider, question: str, draft_answer: str) -> dict:
+    """Cheap completeness check on a draft answer before it's returned: does
+    it address every part of the original question (which may have several
+    parts)? A malformed/unparseable response defaults to
+    {"complete": True, "missing": ""} -- a self-check failure means "ship
+    the draft as-is", never a reason to block the answer or raise."""
+    prompt = (
+        "Ты проверяешь черновой ответ на вопрос пользователя по базе "
+        "закупок компании. Оцени: полностью ли черновой ответ покрывает ВСЕ "
+        "части исходного вопроса (вопрос мог состоять из нескольких частей, "
+        "а ответ покрывать только одну), или чего-то не хватает.\n\n"
+        f"Исходный вопрос: {question}\n\n"
+        f"Черновой ответ: {draft_answer}\n\n"
+        "Верни ТОЛЬКО валидный JSON без markdown-ограждений, в точности "
+        "такой структуры:\n"
+        '{"complete": true или false, "missing": "<чего именно не хватает, '
+        'если complete=false, иначе пустая строка>"}'
+    )
+    parsed = _parse_step_response(_generate_content(client, prompt))
+    if not isinstance(parsed, dict) or "complete" not in parsed:
+        return {"complete": True, "missing": ""}
+    missing = parsed.get("missing")
+    return {
+        "complete": bool(parsed.get("complete")),
+        "missing": missing.strip() if isinstance(missing, str) else "",
+    }
 
 
 def _phrase_answer(

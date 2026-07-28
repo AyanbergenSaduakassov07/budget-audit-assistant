@@ -37,19 +37,18 @@ import pandas as pd
 from legacy import warehouse
 from legacy.query_engine import (
     DailyQuotaExhausted,
-    _generate_sql,
     _generate_sql_with_error_feedback,
     _get_client,
-    _phrase_answer,
-    classify_question,
-    decompose_question,
+    next_step,
+    self_check_answer,
     synthesize_answer,
 )
 
-# Compound questions are split into at most this many sub-questions, even if
-# the model's decomposition returns more — bounds both LLM call count and
-# temp-DB query count for a single answer_over_file() invocation.
-_MAX_SUBQUESTIONS = 4
+# Hard cap on how many next_step() calls a single answer_over_file()
+# invocation may make in total (main loop + the self-check's optional one
+# extra step both draw from this same budget — see _answer_via_step_loop) —
+# bounds both LLM call count and temp-DB query count.
+_MAX_STEPS = 4
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +136,7 @@ _FLAG_DESCRIPTIONS = {
 
 # Few-shot examples grounded in THIS module's real `budget_items` schema
 # (branch, cost_type, statya_code, plan_<year>/fact_<year>/forecast_<year>).
-# Passed explicitly into _generate_sql() instead of falling back to
+# Passed explicitly into every next_step() call instead of falling back to
 # query_engine's default _SQL_EXAMPLES, which are written against the
 # unrelated synthetic `procurements` table (subtotal/subsidiary/category/year)
 # and would otherwise show the model a correct schema description alongside
@@ -346,76 +345,151 @@ Precomputed anomaly flags (уже посчитаны пайплайном ауд
 """ + (f"\n{structural_notes}\n" if structural_notes else "")
 
 
-def _generate_and_run_sql(
+def _execute_step_sql(
+    client,
+    question: str,
+    schema: str,
+    db_path: str,
+    sql: str,
+    reason: str,
+    history: list[tuple[str, str]] | None,
+) -> tuple[str, str]:
+    """Execute one step's proposed SQL; on failure, retry once via the same
+    self-correction every SQL attempt in this module has always used
+    (_generate_sql_with_error_feedback). Never raises: even a failure that
+    survives the retry is recorded as an explicit failure note rather than
+    aborting the whole answer — the model sees it on the NEXT step (in the
+    scratchpad) and can change approach, which is exactly the reactive
+    behavior the step loop exists for. Returns (sql_actually_run, result_text).
+    """
+    retry_question = f"{question}\n\n(Причина этого запроса: {reason})" if reason else question
+    try:
+        df = warehouse.run_sql(sql, db_path)
+        return sql, (df.to_string(index=False) if not df.empty else "(пустой результат)")
+    except Exception as exc:
+        corrected_sql = _generate_sql_with_error_feedback(
+            client, retry_question, schema, sql, str(exc), history=history,
+        )
+        try:
+            df = warehouse.run_sql(corrected_sql, db_path)
+        except Exception as retry_exc:
+            logger.info(
+                "file SQL step retry also failed for question %r — "
+                "first attempt: %s | retry: %s",
+                question, sql, corrected_sql,
+            )
+            return corrected_sql, f"(ошибка выполнения запроса: {retry_exc})"
+        logger.info(
+            "file SQL step self-correction succeeded for question %r — "
+            "first attempt: %s | retry: %s",
+            question, sql, corrected_sql,
+        )
+        return corrected_sql, (df.to_string(index=False) if not df.empty else "(пустой результат)")
+
+
+def _run_steps(
     client,
     question: str,
     schema: str,
     db_path: str,
     history: list[tuple[str, str]] | None,
-) -> tuple[str, pd.DataFrame]:
-    """Generate SQL for `question` and execute it; on failure, retry once via
-    _generate_sql_with_error_feedback (see fix #2). Raises if both the first
-    attempt and the corrected retry fail to execute — callers decide the
-    fallback. Logs both SQLs at INFO whenever a retry happens, either way.
-
-    Shared by the simple single-question path and each sub-question of the
-    compound path, so the same one-retry discipline applies to both.
-    """
-    sql = _generate_sql(
-        client, question, schema, history=history,
-        examples=_BUDGET_ITEMS_SQL_EXAMPLES,
-    )
-    try:
-        df = warehouse.run_sql(sql, db_path)
-        return sql, df
-    except Exception as exc:
-        corrected_sql = _generate_sql_with_error_feedback(
-            client, question, schema, sql, str(exc), history=history,
+    scratchpad: list[dict],
+    max_calls: int,
+) -> tuple[str | None, int]:
+    """Run up to max_calls next_step() calls, mutating `scratchpad` in place
+    with a {"sql", "result", "reason"} entry for every query executed.
+    Returns (final_answer, calls_made) -- final_answer is None if max_calls
+    was used up (or the model returned something malformed) without ever
+    choosing "final"."""
+    calls_made = 0
+    while calls_made < max_calls:
+        calls_made += 1
+        step = next_step(
+            client, question, schema, scratchpad, history=history,
+            examples=_BUDGET_ITEMS_SQL_EXAMPLES,
         )
-        try:
-            df = warehouse.run_sql(corrected_sql, db_path)
-        except Exception:
-            logger.info(
-                "file SQL retry also failed for question %r — "
-                "first attempt: %s | retry: %s",
-                question, sql, corrected_sql,
-            )
-            raise
-        logger.info(
-            "file SQL self-correction succeeded for question %r — "
-            "first attempt: %s | retry: %s",
-            question, sql, corrected_sql,
-        )
-        return corrected_sql, df
+        action = step.get("action")
+        if action == "final":
+            return step["answer"], calls_made
+        if action != "query":
+            break  # malformed/empty response -- stop, caller forces synthesis
+        sql, reason = step["sql"], step.get("reason", "")
+        sql_used, result_text = _execute_step_sql(client, question, schema, db_path, sql, reason, history)
+        scratchpad.append({"sql": sql_used, "result": result_text, "reason": reason})
+    return None, calls_made
 
 
-def _answer_compound(
+def _forced_synthesis(
+    client,
+    question: str,
+    scratchpad: list[dict],
+    history: list[tuple[str, str]] | None,
+) -> str | None:
+    """The step budget ran out (or the model returned something malformed)
+    without ever choosing "final" -- force one synthesis call over whatever
+    ended up in the scratchpad, rather than loop forever or surface an
+    error. None if the scratchpad is empty (nothing to synthesize from)."""
+    if not scratchpad:
+        return None
+    subresults = [(entry.get("reason") or question, entry["sql"], entry["result"]) for entry in scratchpad]
+    return synthesize_answer(client, question, subresults, history=history) or None
+
+
+def _answer_via_step_loop(
     client,
     question: str,
     schema: str,
     db_path: str,
     history: list[tuple[str, str]] | None,
 ) -> str | None:
-    """Decompose a compound question into sub-questions, answer each with the
-    single-question SQL path, and synthesize one final answer from all the
-    sub-results. Returns None if decomposition yields nothing usable. Any
-    exception (decomposition or a sub-query exhausting its retry) propagates
-    to the caller, which falls back to treating the question as simple.
+    """The bounded step loop: propose-execute-observe up to _MAX_STEPS
+    next_step() calls total, forced synthesis if the budget runs out, then a
+    single self-check pass that may spend one more of the SAME budget's
+    calls to fill a gap the model itself flags. A simple question that's
+    fully answered by one query still resolves the same way as before this
+    change: one query executed, then the very next call finalizes it.
+
+    Logs how many queries were run and where the final answer came from
+    (the model finalizing directly, forced synthesis, or the self-check's
+    extra step) -- useful signal for whether _MAX_STEPS is well-tuned once
+    real usage starts.
     """
-    sub_questions = decompose_question(client, question, schema, history=history)
-    sub_questions = sub_questions[:_MAX_SUBQUESTIONS]
-    if not sub_questions:
-        return None
+    scratchpad: list[dict] = []
+    final_answer, calls_used = _run_steps(client, question, schema, db_path, history, scratchpad, _MAX_STEPS)
+    source = "model"
 
-    logger.info("question %r decomposed into sub-questions: %s", question, sub_questions)
+    if final_answer is None:
+        final_answer = _forced_synthesis(client, question, scratchpad, history)
+        if final_answer is None:
+            return None
+        calls_used = _MAX_STEPS
+        source = "forced_synthesis"
 
-    subresults: list[tuple[str, str, str]] = []
-    for sub_question in sub_questions:
-        sub_sql, sub_df = _generate_and_run_sql(client, sub_question, schema, db_path, history)
-        result_text = sub_df.to_string(index=False) if not sub_df.empty else "(пустой результат)"
-        subresults.append((sub_question, sub_sql, result_text))
+    if calls_used < _MAX_STEPS:
+        check = self_check_answer(client, question, final_answer)
+        if not check["complete"]:
+            follow_up = (
+                f"{question}\n\n(По итогам самопроверки в ответе не хватает: "
+                f"{check['missing']})" if check["missing"] else question
+            )
+            extra_answer, extra_calls = _run_steps(
+                client, follow_up, schema, db_path, history, scratchpad, max_calls=1,
+            )
+            calls_used += extra_calls
+            if extra_answer is not None:
+                final_answer = extra_answer
+                source = "self_check_extra_step"
+            else:
+                synthesized = _forced_synthesis(client, question, scratchpad, history)
+                if synthesized is not None:
+                    final_answer = synthesized
+                    source = "self_check_forced_synthesis"
 
-    return synthesize_answer(client, question, subresults, history=history) or None
+    logger.info(
+        "question %r answered via step loop: source=%s queries_run=%d model_calls=%d",
+        question, source, len(scratchpad), calls_used,
+    )
+    return final_answer
 
 
 def answer_over_file(
@@ -426,29 +500,28 @@ def answer_over_file(
 ) -> str | None:
     """Answer a question via LLM text-to-SQL over the current file's data.
 
+    A bounded step loop (see _answer_via_step_loop): on each step the model
+    sees the original question, the schema, and every {sql, result} pair
+    from prior steps in THIS answer, and either proposes one more SQL query
+    (with a short reason) or gives a final answer. This lets the model react
+    to what an earlier query reveals -- e.g. look up which branch has the
+    worst quarterly mismatch, then query that specific branch's suppliers --
+    something a fixed up-front decomposition (this module's old classify/
+    decompose/synthesize path) could never do, since every sub-question was
+    planned before any of them ran. A simple question still resolves with
+    exactly one query executed, same as before this change; it just takes
+    one additional (cheap) call to confirm nothing more is needed.
+
     history: the last few (question, answer) text pairs from the chat, in
     order, so a follow-up like "а за все года" is understood against the
-    prior turn instead of in isolation — passed straight through to
-    _generate_sql/_phrase_answer, which cap and label it in the prompt (see
-    legacy.query_engine._format_history). Text only, no raw data, so this
-    doesn't touch the existing data-minimization boundary.
-
-    A cheap classify_question() call decides the path:
-    - "simple": single SQL generation + execute, with the one-retry
-      self-correction from fix #2 (_generate_and_run_sql).
-    - "compound": decompose_question() splits the question into 2-4
-      self-contained sub-questions (capped at _MAX_SUBQUESTIONS even if the
-      model returns more), each is answered via the same single-question SQL
-      path, and synthesize_answer() combines all the sub-results into one
-      final answer.
-
-    Classification, decomposition, and the compound path as a whole never
-    abort the call: any failure there falls back to the simple single-SQL
-    path instead. Only if that also fails does this return None.
+    prior turn instead of in isolation -- passed straight through to every
+    step's prompt (see legacy.query_engine._format_history). Text only, no
+    raw data, so this doesn't touch the existing data-minimization boundary.
 
     Returns the Russian answer string, or None on ANY failure (missing key,
-    quota, empty data, bad SQL even after the retry, no numeric columns) — the
-    caller then shows its existing not-found message. Never raises.
+    quota, empty data, no numeric columns, the step loop never producing an
+    answer) -- the caller then shows its existing not-found message. Never
+    raises.
     """
     try:
         if combined is None or combined.empty:
@@ -457,7 +530,7 @@ def answer_over_file(
         if not money:
             return None  # nothing numeric to query against
         flags = _split_flag_columns(combined)
-        client = _get_client()  # raises RuntimeError if OPENROUTER_API_KEY is unset
+        client = _get_client()  # raises RuntimeError if no provider is configured
     except Exception:
         return None
 
@@ -465,33 +538,7 @@ def answer_over_file(
     try:
         db_path = _load_temp_db(combined, dims, money, flags)
         schema = _schema_description(combined, meta or {}, dims, money, flags)
-
-        classification = "simple"
-        try:
-            classification = classify_question(client, question, schema)
-        except Exception:
-            logger.info(
-                "question classification failed for %r — treating as simple",
-                question,
-            )
-        logger.info("question %r classified as %s", question, classification)
-
-        if classification == "compound":
-            try:
-                compound_answer = _answer_compound(client, question, schema, db_path, history)
-            except Exception:
-                logger.info(
-                    "compound path failed for %r — falling back to simple", question,
-                )
-                compound_answer = None
-            if compound_answer is not None:
-                return compound_answer
-            # Falls through to the simple path below.
-
-        sql, df = _generate_and_run_sql(client, question, schema, db_path, history)
-        result_text = df.to_string(index=False) if not df.empty else "(пустой результат)"
-        answer = _phrase_answer(client, question, sql, result_text, empty=df.empty, history=history)
-        return answer or None
+        return _answer_via_step_loop(client, question, schema, db_path, history)
     except DailyQuotaExhausted:
         return None
     except Exception:
