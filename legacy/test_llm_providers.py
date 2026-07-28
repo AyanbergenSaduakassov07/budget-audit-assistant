@@ -287,9 +287,12 @@ def test_complete_gives_up_after_max_attempts_of_connection_errors(monkeypatch):
         provider._complete("prompt")
 
 
-# --- get_provider() selection: OpenRouter is the only provider ------------------
+# --- get_provider() selection: OpenRouter or an internal endpoint ---------------
 def _clear_provider_env(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_MODEL", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_API_KEY", raising=False)
 
 
 def test_get_provider_selects_openrouter_when_key_set(monkeypatch):
@@ -301,4 +304,38 @@ def test_get_provider_selects_openrouter_when_key_set(monkeypatch):
 def test_get_provider_raises_when_nothing_configured(monkeypatch):
     _clear_provider_env(monkeypatch)
     with pytest.raises(RuntimeError):
+        get_provider()
+
+
+def test_get_provider_local_base_url_takes_precedence_over_openrouter(monkeypatch):
+    """LOCAL_LLM_BASE_URL is the deployment target -- it must win even when
+    OPENROUTER_API_KEY is also set."""
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-openrouter-key")
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://llm-host:8000/v1")
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "Qwen3-32B")
+
+    provider = get_provider()
+    assert isinstance(provider, OpenRouterProvider)
+    assert provider._model == "Qwen3-32B"
+    assert str(provider._client.base_url) == "http://llm-host:8000/v1/"
+
+
+def test_get_provider_local_llm_api_key_optional(monkeypatch):
+    """LOCAL_LLM_API_KEY unset must still construct a working client, using
+    the "local" placeholder -- many internal OpenAI-compatible servers don't
+    check the key at all."""
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://llm-host:8000/v1")
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "Qwen3-32B")
+
+    provider = get_provider()
+    assert isinstance(provider, OpenRouterProvider)
+    assert provider._client.api_key == "local"
+
+
+def test_get_provider_local_base_url_without_model_raises(monkeypatch):
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://llm-host:8000/v1")
+    with pytest.raises(RuntimeError, match="LOCAL_LLM_MODEL"):
         get_provider()

@@ -1,11 +1,18 @@
-"""Pluggable LLM provider behind the OpenRouter text-generation calls.
+"""Pluggable LLM provider behind the OpenRouter / internal-endpoint text-
+generation calls.
 
 legacy.query_engine and core.budget_narrator drive an LLMProvider through two
 methods, generate_sql(prompt) and generate_json(prompt), instead of importing
-openai directly. Provider selection (get_provider): OPENROUTER_API_KEY set ->
-OpenRouterProvider (openai SDK, base_url pointed at OpenRouter, currently
-configured for qwen/qwen3.6-27b). Without OPENROUTER_API_KEY, get_provider()
-raises RuntimeError. This is the only LLM provider in this codebase.
+openai directly. Provider selection (get_provider), in order:
+  1. LOCAL_LLM_BASE_URL set -> OpenRouterProvider pointed at that internal
+     OpenAI-compatible endpoint (vLLM/TGI etc — the company's own serving stack),
+     using LOCAL_LLM_MODEL and (optional) LOCAL_LLM_API_KEY.
+  2. OPENROUTER_API_KEY set -> OpenRouterProvider pointed at OpenRouter,
+     currently configured for qwen/qwen3.6-27b.
+  3. Neither set -> RuntimeError.
+Both routes share the exact same class/retry logic — only base_url, model,
+and api_key differ; a local deployment target is not a parallel
+implementation, just a different set of constructor arguments.
 
 OpenRouterProvider implements a retry/backoff policy (_RETRY_STATUS,
 _MAX_ATTEMPTS, _BASE_DELAY_S) and raises DailyQuotaExhausted on a
@@ -49,6 +56,11 @@ _OPENROUTER_REASONING_EXTRA_BODY = {"reasoning": {"enabled": False}}
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _OPENROUTER_DEFAULT_MODEL = "qwen/qwen3.6-27b"
 
+# Many internal OpenAI-compatible servers (vLLM/TGI) accept any non-empty
+# api_key string, or don't check it at all -- LOCAL_LLM_API_KEY is therefore
+# optional, defaulting to this placeholder rather than requiring one.
+_LOCAL_LLM_DEFAULT_API_KEY = "local"
+
 
 class DailyQuotaExhausted(Exception):
     """Raised when the active provider's daily API quota is exhausted (not retryable)."""
@@ -81,13 +93,18 @@ def _log_call(model: str, started_at: float, response, attempt: int) -> None:
 
 
 class OpenRouterProvider:
-    """openai SDK client pointed at OpenRouter."""
+    """openai SDK client pointed at any OpenAI-compatible chat-completions
+    endpoint -- OpenRouter by default, or an internal server (base_url
+    overridden, e.g. the company's own vLLM/TGI deployment via LOCAL_LLM_BASE_URL).
+    The retry/backoff/logging policy is identical either way; only
+    base_url/model/api_key differ, so this stays one implementation rather
+    than a parallel class per target."""
 
-    def __init__(self, api_key: str, model: str | None = None) -> None:
+    def __init__(self, api_key: str, model: str | None = None, base_url: str = _OPENROUTER_BASE_URL) -> None:
         self._model = model or os.environ.get("OPENROUTER_MODEL", _OPENROUTER_DEFAULT_MODEL)
         # max_retries=0: retry/backoff is handled by _complete, not the SDK.
         self._client = openai.OpenAI(
-            api_key=api_key, base_url=_OPENROUTER_BASE_URL, max_retries=0
+            api_key=api_key, base_url=base_url, max_retries=0
         )
 
     def _complete(self, prompt: str) -> str:
@@ -103,7 +120,7 @@ class OpenRouterProvider:
                 content = response.choices[0].message.content or ""
                 if not content.strip():
                     logger.warning(
-                        "OpenRouter model=%s returned empty message.content "
+                        "LLM provider model=%s returned empty message.content "
                         "(reasoning mode may have consumed the output budget)",
                         self._model,
                     )
@@ -163,13 +180,33 @@ class OpenRouterProvider:
 def get_provider() -> LLMProvider:
     """Select the active provider, or fail with a clear message.
 
-    OPENROUTER_API_KEY set -> OpenRouter. Otherwise -> RuntimeError.
+    Precedence: LOCAL_LLM_BASE_URL set -> that internal OpenAI-compatible
+    endpoint (the deployment target, so it wins even if OPENROUTER_API_KEY
+    is also set). Otherwise OPENROUTER_API_KEY -> OpenRouter. Otherwise ->
+    RuntimeError.
     """
+    local_base_url = os.environ.get("LOCAL_LLM_BASE_URL")
+    if local_base_url:
+        local_model = os.environ.get("LOCAL_LLM_MODEL")
+        if not local_model:
+            raise RuntimeError(
+                "LOCAL_LLM_BASE_URL is set but LOCAL_LLM_MODEL is not. Set both, e.g.:\n"
+                "    export LOCAL_LLM_BASE_URL=http://<llm-host>:<port>/v1\n"
+                "    export LOCAL_LLM_MODEL=<served-checkpoint-name>"
+            )
+        local_api_key = os.environ.get("LOCAL_LLM_API_KEY") or _LOCAL_LLM_DEFAULT_API_KEY
+        return OpenRouterProvider(local_api_key, model=local_model, base_url=local_base_url)
+
     openrouter_key = os.environ.get("OPENROUTER_API_KEY")
     if openrouter_key:
         return OpenRouterProvider(openrouter_key)
 
     raise RuntimeError(
-        "No LLM provider configured. Set OPENROUTER_API_KEY, e.g.:\n"
+        "No LLM provider configured. Set LOCAL_LLM_BASE_URL (+ LOCAL_LLM_MODEL) "
+        "to point at an internal OpenAI-compatible endpoint, or OPENROUTER_API_KEY "
+        "for OpenRouter, e.g.:\n"
+        "    export LOCAL_LLM_BASE_URL=http://<llm-host>:<port>/v1\n"
+        "    export LOCAL_LLM_MODEL=<served-checkpoint-name>\n"
+        "or:\n"
         "    export OPENROUTER_API_KEY=your_key_here"
     )
