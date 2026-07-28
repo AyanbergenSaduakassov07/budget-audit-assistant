@@ -65,10 +65,20 @@ def _format_amount(value) -> str:
 
 
 def _item_label(row) -> str:
-    """'{article_code} — {counterparty}', degrading gracefully if either is blank."""
+    """'{article_code} — {name}', degrading gracefully if either is blank.
+
+    name prefers counterparty, but falls back to item_name then statya_name
+    when counterparty is blank -- otherwise every counterparty-less row
+    sharing the same article_code renders as the same indistinguishable
+    "{code} — —" label, even when they're genuinely different line items."""
     article = _clean_text(row.get("article_code"))
-    counterparty = _clean_text(row.get("counterparty")) or "—"
-    return f"{article} — {counterparty}" if article else counterparty
+    name = (
+        _clean_text(row.get("counterparty"))
+        or _clean_text(row.get("item_name"))
+        or _clean_text(row.get("statya_name"))
+        or "—"
+    )
+    return f"{article} — {name}" if article else name
 
 
 def _final_decision(all_rows: pd.DataFrame | None, idx) -> str | None:

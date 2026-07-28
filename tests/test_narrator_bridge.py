@@ -171,6 +171,36 @@ def test_narrative_opening_model_error_falls_back(quarterly_result, monkeypatch)
 
 
 # --- conclusion .docx bridge (Prompt 5) -----------------------------------------
+def test_item_label_falls_back_to_item_name_before_dash():
+    """Two rows sharing the same article_code with no counterparty must NOT
+    render as the same indistinguishable "{code} — —" label -- item_name
+    (then statya_name) should distinguish them."""
+    from core.conclusion_generator import _item_label
+
+    row_a = {"article_code": "IT-CA-01", "counterparty": None, "item_name": "Серверы", "statya_name": "Оборудование"}
+    row_b = {"article_code": "IT-CA-01", "counterparty": None, "item_name": "СХД", "statya_name": "Оборудование"}
+
+    label_a = _item_label(row_a)
+    label_b = _item_label(row_b)
+
+    assert label_a == "IT-CA-01 — Серверы"
+    assert label_b == "IT-CA-01 — СХД"
+    assert label_a != label_b
+
+
+def test_item_label_prefers_counterparty_falls_back_to_statya_name_then_dash():
+    from core.conclusion_generator import _item_label
+
+    with_counterparty = {"article_code": "IT-OP-01", "counterparty": "Телеком Плюс", "item_name": "Связь"}
+    assert _item_label(with_counterparty) == "IT-OP-01 — Телеком Плюс"
+
+    no_counterparty_or_item_name = {"article_code": "IT-OP-01", "counterparty": "", "item_name": "", "statya_name": "Услуги связи"}
+    assert _item_label(no_counterparty_or_item_name) == "IT-OP-01 — Услуги связи"
+
+    all_blank = {"article_code": "IT-OP-01", "counterparty": None, "item_name": None, "statya_name": None}
+    assert _item_label(all_blank) == "IT-OP-01 — —"
+
+
 def test_conclusion_payload_sections(quarterly_result):
     """The adapter dict must satisfy conclusion_generator's payload builder:
     section tables consistent with the summary footers."""
