@@ -371,7 +371,9 @@ def _cached_conclusion_pptx(file_bytes: bytes, threshold: float) -> tuple[bytes,
         entity = str(result.get("entity") or "компании").strip().replace(" ", "_")
         filename = f"Заключение_{entity}_{result.get('budget_year') or ''}.pptx".replace("_.", ".")
         out_dir = tempfile.mkdtemp()
-        out_path = generate_pptx_conclusion(result, os.path.join(out_dir, filename))
+        out_path = generate_pptx_conclusion(
+            result, os.path.join(out_dir, filename), threshold_pct=threshold,
+        )
         with open(out_path, "rb") as fh:
             data = fh.read()
         os.unlink(out_path)
