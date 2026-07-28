@@ -14,7 +14,7 @@ app.py only reshapes, renames, formats, and renders what that layer returns.
 
 Layout: centered ~820px column, quiet single-line title top-left, bordered
 chat bubbles on a warm near-white surface, navy #1F3A5F as accent only.
-The YoY threshold slider lives in a "⚙️ Настройки" popover pinned near the
+The YoY threshold slider lives in a "Настройки" popover pinned near the
 chat input.
 
 State model (st.session_state):
@@ -547,21 +547,23 @@ def render_analysis(entry: dict) -> None:
     if docx:
         data, filename = docx
         st.download_button(
-            "📄 Скачать заключение (.docx)",
+            "Скачать заключение (.docx)",
             data=data,
             file_name=filename,
             mime=DOCX_MIME,
             key=f"docx_{entry.get('uid', id(entry))}",
+            icon=":material/description:",
         )
     pptx = _cached_conclusion_pptx(entry["bytes"], _current_threshold())
     if pptx:
         data, filename = pptx
         st.download_button(
-            "📊 Скачать презентацию (.pptx)",
+            "Скачать презентацию (.pptx)",
             data=data,
             file_name=filename,
             mime=PPTX_MIME,
             key=f"pptx_{entry.get('uid', id(entry))}",
+            icon=":material/slideshow:",
         )
     st.caption("Задайте вопрос по файлу — например, «сколько CAPEX в 2027» или "
                "«какая ветка тратит больше».")
@@ -644,7 +646,7 @@ for entry in history:
         else:
             st.write(entry["content"])
 
-with st.popover("⚙️ Настройки"):
+with st.popover("Настройки", icon=":material/settings:"):
     st.slider(
         "Порог резкого изменения год-к-году, %",
         min_value=5, max_value=50, value=DEFAULT_THRESHOLD, step=1,
@@ -668,7 +670,7 @@ if submitted:
     if files:
         f = files[0]
         st.session_state["active_file"] = {"name": f.name, "bytes": f.getvalue()}
-        history.append({"role": "user", "content": f"📎 {f.name}"})
+        history.append({"role": "user", "content": f"Файл: {f.name}"})
         # uid keeps the download-button widget key unique even when the same
         # file is uploaded twice in one session.
         history.append({"role": "assistant", "kind": "analysis", "name": f.name,
