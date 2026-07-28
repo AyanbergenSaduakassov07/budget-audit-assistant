@@ -33,10 +33,11 @@ Per SPEC_AUDIT.md architecture rule: pure module, no streamlit imports.
 from __future__ import annotations
 
 import logging
-import os
 import re
 
 import pandas as pd
+
+from legacy.llm_providers import get_provider
 
 logger = logging.getLogger(__name__)
 
@@ -232,12 +233,15 @@ def _concentration(combined: pd.DataFrame, plan: pd.Series) -> dict:
 
 def narrative_opening(meta: dict, combined: pd.DataFrame) -> str | None:
     """LLM executive summary + risk level for the opening of the first
-    assistant message. Returns None on ANY failure or when no provider key
-    (OPENROUTER_API_KEY) is set — the caller then uses the template summary.
-    Never raises."""
+    assistant message. Returns None on ANY failure or when no provider is
+    configured — the caller then uses the template summary. Never raises.
+
+    get_provider() is called directly (same as file_sql.py's _get_client()
+    call) rather than checking a specific env var, so this never drifts out
+    of sync with get_provider()'s own precedence between OPENROUTER_API_KEY
+    and LOCAL_LLM_BASE_URL."""
     try:
-        if not os.environ.get("OPENROUTER_API_KEY"):
-            return None
+        get_provider()  # raises RuntimeError if no provider is configured
         # Imported lazily so a missing/broken provider SDK install degrades to
         # the template summary instead of taking the whole app down at import.
         from core.budget_narrator import narrate_audit

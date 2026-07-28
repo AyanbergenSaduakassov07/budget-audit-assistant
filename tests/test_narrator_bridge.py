@@ -91,14 +91,52 @@ def test_adapter_survives_empty_and_missing_columns():
 
 
 # --- never-raises guarantee ------------------------------------------------------
-def test_narrative_opening_returns_none_without_key(quarterly_result, monkeypatch):
+def _clear_provider_env(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_MODEL", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_API_KEY", raising=False)
+
+
+def test_narrative_opening_returns_none_without_key(quarterly_result, monkeypatch):
+    _clear_provider_env(monkeypatch)
     meta, combined = quarterly_result
     assert narrative_opening(meta, combined) is None
 
 
+def test_narrative_opening_returns_none_without_any_provider_configured(quarterly_result, monkeypatch):
+    """Neither OPENROUTER_API_KEY nor LOCAL_LLM_BASE_URL set -> get_provider()
+    raises inside narrative_opening()'s try/except -> None, gracefully."""
+    _clear_provider_env(monkeypatch)
+    meta, combined = quarterly_result
+    assert narrative_opening(meta, combined) is None
+
+
+def test_narrative_opening_attempts_generation_with_local_llm_base_url(quarterly_result, monkeypatch):
+    """No OPENROUTER_API_KEY, only LOCAL_LLM_BASE_URL + LOCAL_LLM_MODEL set ->
+    narrative_opening() must still attempt generation (via get_provider()'s
+    own precedence), not silently short-circuit to None the way the old
+    hardcoded OPENROUTER_API_KEY-only gate did."""
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://llm-host:8000/v1")
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "Qwen3-32B")
+
+    meta, combined = quarterly_result
+    import core.budget_narrator as bn
+    monkeypatch.setattr(bn, "_get_client", lambda: object())
+    monkeypatch.setattr(bn, "_generate_content", lambda client, prompt: (
+        '{"executive_summary": "Бюджет 350 000 тыс. тг; 2 статьи с расхождением по кварталам.",'
+        ' "risk_level": "средний", "atk_items": [], "clarification_items": [],'
+        ' "key_risks": [], "note_on_prior_year": ""}'
+    ))
+
+    text = narrative_opening(meta, combined)
+    assert text.startswith("Бюджет 350 000")
+    assert "Уровень риска: средний." in text
+
+
 def test_narrative_opening_never_raises_on_garbage_input(monkeypatch):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    _clear_provider_env(monkeypatch)
     assert narrative_opening(None, None) is None
     monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key-no-network")
     # With a key set, garbage input must still degrade to None, not raise —
