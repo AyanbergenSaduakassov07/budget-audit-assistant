@@ -9,5 +9,9 @@ textColor = "#2C2C2A"
 
 # Real budget forms are small spreadsheets; 25MB is generous headroom while
 # ruling out multi-hundred-MB uploads.
+# fileWatcherType="none" turns off Streamlit's dev-mode file watcher (and the
+# "Source file changed" banner it triggers) — this is a production deployment,
+# not a live-editing dev session.
 [server]
 maxUploadSize = 25
+fileWatcherType = "none"
