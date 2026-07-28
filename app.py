@@ -327,6 +327,10 @@ def _analyze(file_bytes: bytes, threshold: float) -> dict:
         "empty_sheets": [sn for sn in sheets if sn not in usable],
         "plan_year": plan_year,
         "plan_col": f"plan_{plan_year}" if plan_year else None,
+        # Sheets whose column layout came from the LLM fallback (parser.py's
+        # deterministic pass couldn't find/trust a header on them) rather
+        # than the validated template rules -- see render_analysis.
+        "llm_fallback_sheets": [sn for sn, d in flagged.items() if d["stats"].get("parsed_via") == "llm_fallback"],
     }
 
 
@@ -539,6 +543,12 @@ def render_analysis(entry: dict) -> None:
         st.caption(
             "Пустые/незаполненные листы (только шаблон, без данных): "
             + ", ".join(a["empty_sheets"])
+        )
+    if a["llm_fallback_sheets"]:
+        st.warning(
+            "Обнаружен нестандартный формат — колонки определены автоматически, "
+            "проверьте результат перед использованием (листы: "
+            + ", ".join(a["llm_fallback_sheets"]) + ")."
         )
     render_capex_opex(a)
     render_trend(a)

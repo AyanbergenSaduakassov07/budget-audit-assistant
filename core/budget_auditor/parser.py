@@ -53,9 +53,12 @@ just "this year vs. one baseline") a matter of listing whichever plan_*/fact_*/
 forecast_* columns exist on a given sheet, which varies by subsidiary.
 """
 
+import logging
 import re
 import openpyxl
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # Real budget forms run a few hundred rows per sheet; this is generous headroom,
 # not a tight fit. A sheet past this is almost certainly not a ИТ-бюджет form (e.g.
@@ -116,11 +119,13 @@ def _is_valid_budget_code(code) -> bool:
     return bool(_CODE_RE.match(str(code).strip()))
 
 
-def _is_sheet_end_row(ws, row) -> bool:
+def _is_sheet_end_row(ws, row, code_col=3) -> bool:
     """True if the Статья бюджета (code) column carries the sheet's one-time
     ending label (e.g. "Общий результат"). Checked ONLY against this column
-    -- see _SHEET_END_RE."""
-    v = ws.cell(row=row, column=3).value
+    -- see _SHEET_END_RE. code_col defaults to the template family's fixed
+    column C, but follows wherever the code column actually is when driven
+    by an LLM-detected layout (see _detect_layout / parse_sheet)."""
+    v = ws.cell(row=row, column=code_col).value
     return bool(v and _SHEET_END_RE.search(_norm(v)))
 
 
@@ -194,13 +199,104 @@ def _classify_columns(ws, header_row, max_col):
     return colmap, year_cols
 
 
-def parse_sheet(ws, sheet_name, campaign_year=None):
+# Confidence gate for the deterministic pass -- see _detect_layout() and
+# budget_auditor.layout_fallback. Fixed (non-year) roles only; a sheet with a
+# year column but none of these matched is exactly the "header technically
+# found, but almost nothing on it is recognizable" case the LLM fallback
+# exists for. The threshold is deliberately low (real form family sheets clear
+# it with 4+ roles matched -- statya_code/category/subcategory/counterparty
+# at minimum) so it only fires for a genuinely unfamiliar layout, never for
+# any template variant already handled.
+_REQUIRED_SEMANTIC_ROLES = ("statya_code", "category", "subcategory", "counterparty", "justification")
+_MIN_MATCHED_ROLES = 3
+
+
+def _matched_role_count(colmap: dict, year_cols: dict) -> int:
+    """How many of the roles a usable parse needs were actually found --
+    _REQUIRED_SEMANTIC_ROLES matches plus one point for having ANY money
+    (plan/fact/forecast/quarter) column at all, since without one there's
+    nothing to aggregate regardless of how well the other roles matched."""
+    matched = sum(1 for role in _REQUIRED_SEMANTIC_ROLES if role in colmap)
+    if year_cols:
+        matched += 1
+    return matched
+
+
+# A workbook routinely carries several unused per-branch template sheets --
+# a header row (or even just one stray label, e.g. a lone "Статья бюджета"
+# cell) and NOTHING below it. That's low-confidence by the same measure as a
+# genuinely different layout (few/no roles matched), but there's no data
+# there to rescue -- attempting the LLM fallback on every such sheet in a
+# real workbook would be a wasted call every time, not an improvement.
+_MIN_NONEMPTY_CELLS_FOR_FALLBACK = 10
+
+
+def _worth_llm_fallback(ws, header_row) -> bool:
+    """False for a sheet with essentially nothing beneath/around its (few)
+    filled cells -- see _MIN_NONEMPTY_CELLS_FOR_FALLBACK. When a header WAS
+    found, checked specifically below it (a template sheet's header row
+    itself can carry several column labels, which a whole-sheet count would
+    overcount); when none was found at all, checked across the whole sheet."""
+    if header_row is not None:
+        return any(
+            any(c.value is not None and str(c.value).strip() != "" for c in row)
+            for row in ws.iter_rows(min_row=header_row + 1)
+        )
+    count = 0
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None and str(cell.value).strip() != "":
+                count += 1
+                if count >= _MIN_NONEMPTY_CELLS_FOR_FALLBACK:
+                    return True
+    return False
+
+
+def _detect_layout(ws):
+    """The deterministic header-row + column-role detection, as its own step
+    so callers (parse_sheet's default path, and parse_workbook's confidence
+    check before trying the LLM fallback) can both use it without running it
+    twice. Returns (None, {}, {}) when no header row is found at all."""
     header_row = _find_header_row(ws)
     if header_row is None:
-        return None, {"sheet": sheet_name, "error": "no_header_found"}
+        return None, {}, {}
+    colmap, year_cols = _classify_columns(ws, header_row, ws.max_column)
+    return header_row, colmap, year_cols
 
-    max_col = ws.max_column
-    colmap, year_cols = _classify_columns(ws, header_row, max_col)
+
+def parse_sheet(ws, sheet_name, campaign_year=None, header_row=None, colmap=None,
+                year_cols=None, parsed_via="deterministic"):
+    """Parse one worksheet into (df, stats).
+
+    header_row/colmap/year_cols are normally left None: this function then
+    detects them itself via _detect_layout (the original, fully-deterministic
+    behavior, unchanged). A caller that already has a confident layout from
+    elsewhere -- currently only budget_auditor.layout_fallback's LLM-assisted
+    detection, for a sheet the deterministic pass couldn't handle -- can pass
+    them explicitly instead, along with parsed_via="llm_fallback" so that
+    provenance flows through to stats and, from there, to the UI. This is the
+    SAME row-iteration/flagging logic either way; only where the layout came
+    from differs.
+    """
+    if header_row is None:
+        header_row, colmap, year_cols = _detect_layout(ws)
+        if header_row is None:
+            return None, {"sheet": sheet_name, "error": "no_header_found"}
+    elif colmap is None or year_cols is None:
+        colmap, year_cols = _classify_columns(ws, header_row, ws.max_column)
+
+    # Column positions for the roles parse_sheet reads structurally (not via
+    # the generic colmap loop below): default to the template family's fixed
+    # positions (verified ground truth: statya_code/category/subcategory are
+    # always columns C/G/H, statya_name always immediately right of the code
+    # column) so real files parse identically to before, while still
+    # following colmap when it names a different column -- e.g. from an
+    # LLM-detected layout on a genuinely different form.
+    code_col = colmap.get("statya_code", 3)
+    name_col = colmap.get("statya_name", code_col + 1)
+    category_col = colmap.get("category", 7)
+    subcategory_col = colmap.get("subcategory", 8)
+    item_name_col = colmap.get("item_name")  # only set when a mapping names an explicit item_name column
 
     # The "current" plan column is whichever plan_<year> column matches the
     # campaign year from the metadata block -- NOT "whichever comes first".
@@ -227,13 +323,13 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
         # confirmed across every real file examined. Checked ONLY against
         # the code column (never free text) so this can't false-positive on
         # ordinary prose elsewhere in the row -- see _is_sheet_end_row.
-        if _is_sheet_end_row(ws, r):
+        if _is_sheet_end_row(ws, r, code_col=code_col):
             break
 
-        code = ws.cell(row=r, column=3).value
-        code_name = ws.cell(row=r, column=4).value
-        category = ws.cell(row=r, column=7).value
-        subcat = ws.cell(row=r, column=8).value
+        code = ws.cell(row=r, column=code_col).value
+        code_name = ws.cell(row=r, column=name_col).value if name_col else None
+        category = ws.cell(row=r, column=category_col).value if category_col else None
+        subcat = ws.cell(row=r, column=subcategory_col).value if subcategory_col else None
         plan_val = ws.cell(row=r, column=plan_year_col).value if plan_year_col else None
 
         # A code cell only counts as a genuine section declaration if it
@@ -287,20 +383,25 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
             continue
 
         n_leaf += 1
+        # item_name normally derives from category/subcategory (the template
+        # family has no separate column for it); a layout that names one
+        # explicitly (only possible via an LLM-detected mapping -- see
+        # item_name_col above) uses that column's own value instead.
+        item_name_value = ws.cell(row=r, column=item_name_col).value if item_name_col else (eff_subcat or eff_category)
         rec = {
             "sheet": sheet_name,
             "statya_code": cur_code,
             "statya_name": cur_code_name,
             "category": eff_category,
             "subcategory": eff_subcat,
-            "item_name": eff_subcat or eff_category,
+            "item_name": item_name_value,
             # A code that doesn't match the "AA-AA-00"-style format is a
             # data-quality warning, not a parse failure -- surfaced downstream
             # (workbook_summary_text, the flagged-статьи UI), never fatal.
             "anomalous_code_flag": not _is_valid_budget_code(cur_code),
         }
         for role, c in colmap.items():
-            if role in ("statya_code", "category", "subcategory"):
+            if role in ("statya_code", "category", "subcategory", "statya_name", "item_name"):
                 continue
             rec[role] = ws.cell(row=r, column=c).value
         for c, spec in year_cols.items():
@@ -325,6 +426,12 @@ def parse_sheet(ws, sheet_name, campaign_year=None):
         "plan_year": plan_year,
         "years_present": years_present,
         "n_anomalous_code_rows": int(df["anomalous_code_flag"].sum()) if "anomalous_code_flag" in df.columns else 0,
+        # "deterministic" (the template-family rules) or "llm_fallback" (this
+        # sheet's layout came from budget_auditor.layout_fallback because the
+        # deterministic pass couldn't find/trust a header) -- surfaced in the
+        # UI so a guessed mapping is never mistaken for the same confidence
+        # as the validated template path.
+        "parsed_via": parsed_via,
     }
     return df, stats
 
@@ -354,7 +461,51 @@ def parse_workbook(path):
 
     for sn in wb.sheetnames:
         ws = wb[sn]
-        df, stats = parse_sheet(ws, sn, campaign_year=campaign_year)
+        header_row, colmap, year_cols = _detect_layout(ws)
+        parsed_via = "deterministic"
+
+        low_confidence = header_row is None or _matched_role_count(colmap, year_cols) < _MIN_MATCHED_ROLES
+        if low_confidence and not _worth_llm_fallback(ws, header_row):
+            # Low confidence, but there's nothing beneath/around it to
+            # rescue -- almost always an unused per-branch template sheet
+            # (a header row and no data, or even just one stray label).
+            # Skip the fallback attempt entirely rather than spend an LLM
+            # call finding out the same thing detect_layout_via_llm's own
+            # empty-sample check would have concluded anyway.
+            low_confidence = False
+
+        if low_confidence:
+            # The deterministic pass either found no header at all, or found
+            # one but recognized too little of it to trust -- a genuinely
+            # different layout, not one of the template variants already
+            # handled. Imported lazily (not at module top) so a missing/
+            # broken provider SDK install degrades to the original
+            # deterministic result instead of taking parsing down at import;
+            # same convention as narrator_bridge.narrative_opening.
+            logger.info("sheet=%s deterministic layout confidence low; trying LLM fallback", sn)
+            from core.budget_auditor.layout_fallback import detect_layout_via_llm
+
+            fallback = detect_layout_via_llm(ws)
+            if fallback is not None:
+                header_row, colmap, year_cols = fallback
+                parsed_via = "llm_fallback"
+                logger.info("sheet=%s parsed_via=llm_fallback", sn)
+            else:
+                # No usable fallback -- reproduce exactly what the
+                # deterministic pass alone would have returned (the
+                # "no_header_found" error, or a low-confidence-but-unchanged
+                # parse), never a new/different failure mode.
+                logger.info("sheet=%s LLM fallback unavailable/failed; parsed_via=deterministic (unchanged)", sn)
+                header_row = colmap = year_cols = None
+
+        if header_row is None:
+            df, stats = parse_sheet(ws, sn, campaign_year=campaign_year)
+        else:
+            df, stats = parse_sheet(
+                ws, sn, campaign_year=campaign_year,
+                header_row=header_row, colmap=colmap, year_cols=year_cols,
+                parsed_via=parsed_via,
+            )
         sheets_out[sn] = {"df": df, "stats": stats}
     return meta, sheets_out
 
