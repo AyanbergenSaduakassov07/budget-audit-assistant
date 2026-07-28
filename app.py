@@ -47,6 +47,7 @@ from core.budget_auditor.analysis import workbook_summary_text, year_trend_text,
 from core.budget_auditor.narrator_bridge import build_audit_result, narrative_opening
 from core.budget_auditor.file_sql import answer_over_file
 from core.conclusion_generator import generate_conclusion
+from core.conclusion_pptx_generator import generate_pptx_conclusion
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +335,7 @@ def _current_threshold() -> float:
 
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
 
 @st.cache_data(show_spinner=False)
@@ -355,6 +357,28 @@ def _cached_conclusion_docx(file_bytes: bytes, threshold: float) -> tuple[bytes,
         return data, filename
     except Exception:
         logger.exception("conclusion docx generation failed; button not shown")
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def _cached_conclusion_pptx(file_bytes: bytes, threshold: float) -> tuple[bytes, str] | None:
+    """Заключение .pptx (bytes, filename), cached per (file, threshold) — same
+    pattern as _cached_conclusion_docx. None on any failure (e.g. a generation
+    error) — the download button is simply not rendered."""
+    try:
+        a = _analyze(file_bytes, threshold)
+        result = build_audit_result(a["meta"], a["combined"])
+        entity = str(result.get("entity") or "компании").strip().replace(" ", "_")
+        filename = f"Заключение_{entity}_{result.get('budget_year') or ''}.pptx".replace("_.", ".")
+        out_dir = tempfile.mkdtemp()
+        out_path = generate_pptx_conclusion(result, os.path.join(out_dir, filename))
+        with open(out_path, "rb") as fh:
+            data = fh.read()
+        os.unlink(out_path)
+        os.rmdir(out_dir)
+        return data, filename
+    except Exception:
+        logger.exception("conclusion pptx generation failed; button not shown")
         return None
 
 
@@ -526,6 +550,16 @@ def render_analysis(entry: dict) -> None:
             file_name=filename,
             mime=DOCX_MIME,
             key=f"docx_{entry.get('uid', id(entry))}",
+        )
+    pptx = _cached_conclusion_pptx(entry["bytes"], _current_threshold())
+    if pptx:
+        data, filename = pptx
+        st.download_button(
+            "📊 Скачать презентацию (.pptx)",
+            data=data,
+            file_name=filename,
+            mime=PPTX_MIME,
+            key=f"pptx_{entry.get('uid', id(entry))}",
         )
     st.caption("Задайте вопрос по файлу — например, «сколько CAPEX в 2027» или "
                "«какая ветка тратит больше».")
