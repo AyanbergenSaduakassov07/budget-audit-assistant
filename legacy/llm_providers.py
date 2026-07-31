@@ -64,7 +64,17 @@ _OPENROUTER_MAX_OUTPUT_TOKENS = int(os.environ.get("OPENROUTER_MAX_OUTPUT_TOKENS
 _OPENROUTER_REASONING_EXTRA_BODY = {"reasoning": {"enabled": False}}
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-_OPENROUTER_DEFAULT_MODEL = "qwen/qwen3.6-27b"
+# Temporary: qwen/qwen3.6-27b costs real credits and the account is at ~$0.
+# OpenRouter delisted its entire free Qwen tier in the week before 2026-07-31
+# (qwen3-coder, qwen3-next-80b both pulled), so there is currently no free
+# Qwen model to fall back to. nemotron-3-super-120b-a12b is the largest
+# general-purpose model left in OpenRouter's free catalog (not marketed as a
+# "reasoning" model, so it shouldn't fight _OPENROUTER_REASONING_EXTRA_BODY
+# the way a reasoning-first model might) -- closest free substitute available
+# for this app's structured-JSON step-loop + Russian narrative generation.
+# Revert to a paid model (or point LOCAL_LLM_BASE_URL at a local one) once
+# credits are added; swap back is this one line.
+_OPENROUTER_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 # Many internal OpenAI-compatible servers (vLLM/TGI) accept any non-empty
 # api_key string, or don't check it at all -- LOCAL_LLM_API_KEY is therefore
