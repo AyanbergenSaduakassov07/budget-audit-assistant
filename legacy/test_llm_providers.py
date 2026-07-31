@@ -142,7 +142,7 @@ def test_complete_passes_max_tokens_and_disables_reasoning():
     assert fake_client.kwargs["extra_body"] == _OPENROUTER_REASONING_EXTRA_BODY
 
 
-# --- call logging (project rule: every LLM API call gets timestamp/tokens/latency) --
+# --- call logging (PROJECT_NOTES.md: every LLM API call gets timestamp/tokens/latency) --
 def test_complete_logs_call_details_on_success():
     """A successful call must log a timestamp, the model, the attempt number,
     tokens_used, and latency_ms."""

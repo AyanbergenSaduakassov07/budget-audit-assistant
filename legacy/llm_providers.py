@@ -80,7 +80,7 @@ def _is_daily_quota_error(status_code: int | None, message: str) -> bool:
 
 def _log_call(model: str, started_at: float, response, attempt: int) -> None:
     """Log a successful LLM API call: timestamp, tokens_used, latency_ms —
-    per the project's logging requirement. tokens_used is None (not guessed)
+    per PROJECT_NOTES.md's logging requirement. tokens_used is None (not guessed)
     when response.usage.total_tokens isn't populated (OpenRouter's Qwen
     route may or may not include it)."""
     latency_ms = (time.perf_counter() - started_at) * 1000
