@@ -260,11 +260,21 @@ def build_flag_view(subset: pd.DataFrame, plan_col: str | None) -> tuple[pd.Data
 def _format_eager(disp: pd.DataFrame, fmt: dict) -> pd.DataFrame:
     """Apply formatters as values, not via Styler: st.dataframe draws null cells
     as gray 'None' regardless of Styler display text, so NA must become 'н/д'
-    before the frame reaches the grid."""
+    before the frame reaches the grid.
+
+    Columns left out of fmt (e.g. Обоснование, Контрагент) are raw passthrough
+    from the source Excel and can mix strings with a stray numeric cell (an
+    ИНН typed into a counterparty field, say) — object dtype hides this until
+    st.dataframe's Arrow conversion raises "Expected bytes, got a 'int'
+    object". Coerce those to string too, leaving real null values alone so
+    the caller's later .where(notna, "—") still catches them."""
     out = disp.copy()
     for col, formatter in fmt.items():
         if col in out.columns:
             out[col] = out[col].map(formatter)
+    for col in out.columns:
+        if col not in fmt and out[col].dtype == object:
+            out[col] = out[col].map(lambda v: v if pd.isna(v) else str(v))
     return out
 
 

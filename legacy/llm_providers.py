@@ -47,10 +47,20 @@ _DAILY_QUOTA_MARKERS = ("PerDay", "per_day", "RPD")
 # answer is written, and can exhaust a small budget leaving message.content
 # empty. _OPENROUTER_REASONING_EXTRA_BODY asks OpenRouter's unified request
 # format to disable that pass; it's not confirmed to be honored by every
-# model/provider route, so the token budget is also raised (6000) as a
-# second line of defense — belt and suspenders rather than a verified single
-# fix, since this hasn't been checked against a live OpenRouter account.
-_OPENROUTER_MAX_OUTPUT_TOKENS = 6000
+# model/provider route, so the token budget is also raised as a second line
+# of defense — belt and suspenders rather than a verified single fix.
+#
+# Confirmed against a live OpenRouter account (2026-07-31) that actual
+# completion usage for this app's prompts (JSON step responses, narrative
+# summaries) never exceeded ~600 tokens — 6000 was pure headroom, not a real
+# requirement. OpenRouter pre-flight-checks whether the account could afford
+# max_tokens in the worst case and rejects the call with a 402 if not
+# ("requested up to 6000 tokens, but can only afford 3624"), even though the
+# actual response would have used a fraction of that. A lower cap clears
+# that gate on a near-empty balance without truncating any real response.
+# Overridable via OPENROUTER_MAX_OUTPUT_TOKENS so this can be tuned against
+# a specific account balance without a code change.
+_OPENROUTER_MAX_OUTPUT_TOKENS = int(os.environ.get("OPENROUTER_MAX_OUTPUT_TOKENS", "2000"))
 _OPENROUTER_REASONING_EXTRA_BODY = {"reasoning": {"enabled": False}}
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
