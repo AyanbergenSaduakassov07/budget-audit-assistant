@@ -24,6 +24,7 @@ import pandas as pd
 from legacy.query_engine import (
     DailyQuotaExhausted,
     _FORMATTING_INSTRUCTION,
+    _NUMBER_FORMAT_INSTRUCTION,
     _generate_content,
     _get_client,
     _strip_decorative_chars,
@@ -117,6 +118,7 @@ def _build_prompt(context: dict) -> str:
         f"Данные аудита:\n{context_json}\n\n"
         f"{_FORMATTING_INSTRUCTION} Это касается каждого текстового поля ниже "
         "(executive_summary, reason, key_risks, note_on_prior_year).\n\n"
+        f"{_NUMBER_FORMAT_INSTRUCTION}\n\n"
         "Верни ТОЛЬКО валидный JSON без markdown-ограждений (без ```), "
         "без пояснений до или после, в точности такой структуры:\n"
         f"{_RESPONSE_SCHEMA}"

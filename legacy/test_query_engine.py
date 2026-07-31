@@ -143,6 +143,33 @@ def test_strip_decorative_chars_leaves_clean_text_unchanged():
     assert _strip_decorative_chars("5 * 3 = 15, не искажать") == "5 * 3 = 15, не искажать"
 
 
+# --- raw-float rounding (regression) ----------------------------------------------
+# A model can ignore _NUMBER_FORMAT_INSTRUCTION and copy a raw Python float
+# straight into the answer, e.g. "59806.066590896546" тыс. тг, or with a
+# Russian decimal comma, "5,001622%" (observed switching from Qwen3.6 to a
+# free OpenRouter substitute that follows the formatting prompt less
+# reliably). This codebase never uses "." or "," for thousands-grouping
+# (always a space), so any run of 3+ decimal digits is unambiguously leaked
+# float precision, never a legitimate grouped integer.
+def test_strip_decorative_chars_rounds_raw_dot_decimal():
+    raw = "Общая сумма уточнений составляет 59806.066590896546 тыс. тг."
+    assert _strip_decorative_chars(raw) == "Общая сумма уточнений составляет 59806.1 тыс. тг."
+
+
+def test_strip_decorative_chars_rounds_raw_comma_decimal():
+    raw = "Доля поставщика составляет 60.214281186199706%."
+    # Comma form (Russian decimal separator), as seen in a live quarterly-gap answer.
+    assert _strip_decorative_chars("расхождение 5,001622%") == "расхождение 5%"
+    assert _strip_decorative_chars(raw) == "Доля поставщика составляет 60.2%."
+
+
+def test_strip_decorative_chars_leaves_short_decimals_unchanged():
+    """2 decimal digits is a normal, already-formatted figure -- must not be
+    touched (only 3+ digits signals leaked raw precision)."""
+    assert _strip_decorative_chars("Курс 1.25 доллара") == "Курс 1.25 доллара"
+    assert _strip_decorative_chars("Рост на 15,5%") == "Рост на 15,5%"
+
+
 def test_phrase_answer_strips_decorative_chars_from_response():
     class _FakeProvider:
         def generate_json(self, prompt):

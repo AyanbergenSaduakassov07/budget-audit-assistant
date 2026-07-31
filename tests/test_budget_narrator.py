@@ -172,6 +172,24 @@ def test_parse_narrative_strips_decorative_chars_from_all_text_fields():
     assert parsed["risk_level"] == "высокий"  # categorical field, left untouched
 
 
+def test_parse_narrative_rounds_raw_decimals_in_text_fields():
+    """Same live failure as the query_engine regression, but through the
+    narrator's own parsing path: executive_summary carrying an unrounded
+    pandas/Python float straight through to the rendered narrative."""
+    raw = json.dumps({
+        "executive_summary": "Сумма уточнений 59806.066590896546 тыс. тг.",
+        "atk_items": [],
+        "clarification_items": [],
+        "risk_level": "высокий",
+        "key_risks": [],
+        "note_on_prior_year": "",
+    }, ensure_ascii=False)
+
+    parsed = _parse_narrative(raw)
+
+    assert parsed["executive_summary"] == "Сумма уточнений 59806.1 тыс. тг."
+
+
 def test_parse_narrative_leaves_clean_response_unchanged():
     raw = json.dumps({
         "executive_summary": "Бюджет вырос на 15% к прошлому году.",
@@ -196,6 +214,18 @@ def test_build_prompt_includes_formatting_instruction():
     prompt = _build_prompt(_build_context(_fake_audit_result()))
     assert "без эмодзи" in prompt
     assert "markdown" in prompt
+
+
+def test_build_prompt_includes_number_format_instruction():
+    """Regression: this instruction existed in query_engine's Q&A prompts but
+    was never wired into the narrative prompt, so a model that follows
+    formatting instructions less reliably could (and did, in practice) leak
+    a raw unrounded float straight into executive_summary."""
+    from core.budget_narrator import _build_prompt
+
+    prompt = _build_prompt(_build_context(_fake_audit_result()))
+    assert "экспоненциальн" in prompt.lower()
+    assert "разделител" in prompt.lower()
 
 
 # --- narrate_audit: full flow, API mocked out ---------------------------------------

@@ -254,11 +254,35 @@ _MD_ITALIC_STAR_RE = re.compile(r"(?<!\w)\*(.+?)\*(?!\w)")
 _MD_ITALIC_UNDERSCORE_RE = re.compile(r"(?<!\w)_(.+?)_(?!\w)")
 _MD_BULLET_RE = re.compile(r"^[ \t]*[-*][ \t]+")
 
+# Third line of defense (alongside _NUMBER_FORMAT_INSTRUCTION): a model can
+# still copy a raw pandas/Python float straight into its answer despite being
+# told to format numbers with space-grouped thousands -- e.g. "59806.066590896546"
+# or, with a Russian decimal comma, "5,001622%". This codebase's own numeric
+# convention never uses "." or "," for thousands-grouping (always a space, per
+# _NUMBER_FORMAT_INSTRUCTION's example), so any digits-separator-digits run
+# with 3+ decimal digits is unambiguously leaked float precision, never a
+# legitimate grouped integer. Weaker/differently-tuned models (observed
+# switching from Qwen3.6 to a free substitute) follow the prompt instruction
+# less reliably, so this is a deterministic backstop, not a replacement for it.
+_RAW_DECIMAL_RE = re.compile(r"\d+([.,])\d{3,}")
+
+
+def _round_raw_decimals(text: str) -> str:
+    def _round(m: re.Match) -> str:
+        sep = m.group(1)
+        value = float(m.group().replace(",", "."))
+        rounded = f"{value:.1f}".rstrip("0").rstrip(".")
+        return rounded.replace(".", sep) if sep == "," else rounded
+
+    return _RAW_DECIMAL_RE.sub(_round, text)
+
 
 def _strip_decorative_chars(text: str) -> str:
-    """Plain running text: emoji and markdown bold/italic/bullet markers
-    removed. A model that ignores _FORMATTING_INSTRUCTION still can't leak
-    decoration into a document meant to read as an official conclusion."""
+    """Plain running text: emoji, markdown bold/italic/bullet markers, and
+    leaked raw-float precision removed. A model that ignores
+    _FORMATTING_INSTRUCTION or _NUMBER_FORMAT_INSTRUCTION still can't leak
+    decoration or unrounded numbers into a document meant to read as an
+    official conclusion."""
     if not text:
         return text
     cleaned = _EMOJI_RE.sub("", text)
@@ -266,6 +290,7 @@ def _strip_decorative_chars(text: str) -> str:
     cleaned = _MD_ITALIC_STAR_RE.sub(r"\1", cleaned)
     cleaned = _MD_ITALIC_UNDERSCORE_RE.sub(r"\1", cleaned)
     cleaned = "\n".join(_MD_BULLET_RE.sub("", line) for line in cleaned.splitlines())
+    cleaned = _round_raw_decimals(cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned.strip()
 
