@@ -65,16 +65,20 @@ _OPENROUTER_REASONING_EXTRA_BODY = {"reasoning": {"enabled": False}}
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # Temporary: qwen/qwen3.6-27b costs real credits and the account is at ~$0.
-# OpenRouter delisted its entire free Qwen tier in the week before 2026-07-31
-# (qwen3-coder, qwen3-next-80b both pulled), so there is currently no free
-# Qwen model to fall back to. nemotron-3-super-120b-a12b is the largest
-# general-purpose model left in OpenRouter's free catalog (not marketed as a
-# "reasoning" model, so it shouldn't fight _OPENROUTER_REASONING_EXTRA_BODY
-# the way a reasoning-first model might) -- closest free substitute available
-# for this app's structured-JSON step-loop + Russian narrative generation.
+# Re-checked 2026-08-02 (OpenRouter's public free-model catalog, 15 models,
+# unchanged from the 2026-07-27 snapshot): still no free Qwen model (the free
+# tier -- qwen3-coder, qwen3-next-80b -- was delisted in late July and hasn't
+# come back) and DeepSeek has never had a free model on OpenRouter.
+# nemotron-3-ultra-550b-a55b is the largest model in the current free catalog
+# and the highest third-party-rated one of the 15 (quality 62 vs. everything
+# else at 48 or below, per the same source) -- picked over the previously-used
+# nemotron-3-super-120b-a12b for answer quality on compound questions. Trade-
+# off: ~4.5x the active parameters (55B vs 12B) on a free/shared/rate-limited
+# endpoint likely means slower responses, not faster -- this addresses the
+# "wrong or incomplete answer" complaints, not the "slower than Qwen" one.
 # Revert to a paid model (or point LOCAL_LLM_BASE_URL at a local one) once
 # credits are added; swap back is this one line.
-_OPENROUTER_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+_OPENROUTER_DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 # Many internal OpenAI-compatible servers (vLLM/TGI) accept any non-empty
 # api_key string, or don't check it at all -- LOCAL_LLM_API_KEY is therefore
