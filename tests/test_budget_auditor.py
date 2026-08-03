@@ -797,6 +797,119 @@ def test_table_cells_escape_pipes():
     assert _table_rows(reply)[0][0] == "ГО|АФ"  # ...and still one cell when parsed
 
 
+# --- supplier concentration ------------------------------------------------------
+# Live bug: the top-N branch triggered on a bare "риск" substring, which also
+# matches "риск концентрации" -- so every concentration question came back as
+# the Топ-5-most-expensive-items table, identically every time, and there was
+# no concentration answer path in chat_answer() at all.
+def _concentration_df(counterparties, amounts):
+    n = len(counterparties)
+    return pd.DataFrame({
+        "branch": ["ГО"] * n,
+        "cost_type": ["OPEX"] * n,
+        "item_name": [f"Статья {i}" for i in range(n)],
+        "category": ["Услуги"] * n,
+        "subcategory": [None] * n,
+        "counterparty": counterparties,
+        "plan_year": [2026] * n,
+        "plan_2026": amounts,
+    })
+
+
+def test_concentration_question_no_longer_hijacked_by_top_n():
+    """"риск концентрации" must not fall into the top-N branch on the bare
+    "риск" substring."""
+    combined = _concentration_df(["ТОО Альфа", "ТОО Бета"], [30_000.0, 10_000.0])
+    reply = chat_answer("Есть ли риск концентрации у одного поставщика?", combined, {"unit": 1000})
+    assert reply is not None
+    assert "Топ-" not in reply                       # NOT the top-N branch's answer
+    assert "| Контрагент | Сумма | Доля % |" in reply
+    assert "Статья 0" not in reply                   # item names belong to top-N, not here
+
+
+def test_concentration_answer_names_top_supplier_and_share():
+    combined = _concentration_df(["ТОО Альфа", "ТОО Бета"], [75_000.0, 25_000.0])
+    reply = chat_answer("риск концентрации поставщиков", combined, {"unit": 1000})
+    _assert_is_markdown_table(reply, n_cols=3)
+    assert _table_rows(reply) == [
+        ["ТОО Альфа", "75 000 тыс.", "75.0%"],
+        ["ТОО Бета", "25 000 тыс.", "25.0%"],
+    ]
+    assert "Крупнейший контрагент -- ТОО Альфа: 75.0% плана на 2026 год" in reply
+    assert "Это превышает порог концентрации в 40%" in reply
+
+
+def test_concentration_answer_below_threshold_is_not_flagged():
+    """Also covers the "самый крупный поставщик" phrasing, which carries no
+    "риск"/"концентрац" wording of its own."""
+    combined = _concentration_df(
+        ["ТОО Альфа", "ТОО Бета", "ТОО Дельта"], [35_000.0, 35_000.0, 30_000.0]
+    )
+    reply = chat_answer("самый крупный поставщик", combined, {"unit": 1000})
+    assert "Крупнейший контрагент -- ТОО Альфа: 35.0% плана на 2026 год" in reply
+    assert "Это не превышает порог концентрации в 40%" in reply
+
+
+def test_concentration_answer_excludes_compound_counterparty_from_top_supplier():
+    """Mirrors _concentration()'s own coverage: a cell naming two legal
+    entities ("ТОО Бета, АО Гамма") holds the largest share here, but must
+    never be NAMED as the single top supplier -- attributing its combined
+    amount to one company would invent a risk finding. It still shows up in
+    the breakdown for visibility."""
+    combined = _concentration_df(
+        ["ТОО Альфа", "ТОО Бета, АО Гамма", "ТОО Дельта"],
+        [30_000.0, 90_000.0, 10_000.0],
+    )
+    reply = chat_answer("зависимость от одного поставщика", combined, {"unit": 1000})
+    _assert_is_markdown_table(reply, n_cols=3)
+
+    rows = _table_rows(reply)
+    assert rows[0] == ["несколько контрагентов в одной строке", "90 000 тыс.", "69.2%"]
+    # 30 000 of 130 000 -- the compound row's 69.2% is NOT attributed to it.
+    assert "Крупнейший контрагент -- ТОО Альфа: 23.1% плана на 2026 год" in reply
+    assert "Это не превышает порог концентрации в 40%" in reply
+    assert "не приписаны ни одному поставщику" in reply
+
+
+def test_concentration_answer_without_counterparty_data_says_so():
+    combined = _concentration_df([None, None], [30_000.0, 10_000.0])
+    reply = chat_answer("риск концентрации", combined, {"unit": 1000})
+    assert "Контрагенты в этом файле не заполнены" in reply
+    assert "|" not in reply  # no fabricated table
+
+
+def test_concentration_answer_all_compound_rows_refuses_to_name_a_supplier():
+    combined = _concentration_df(["ТОО Альфа, АО Бета"], [40_000.0])
+    reply = chat_answer("риск концентрации", combined, {"unit": 1000})
+    _assert_is_markdown_table(reply, n_cols=3)
+    assert "Крупнейший контрагент" not in reply
+    assert "Ни одну строку нельзя отнести к одному поставщику" in reply
+
+
+def test_concentration_answer_without_plan_column_says_so():
+    combined = _concentration_df(["ТОО Альфа"], [40_000.0]).drop(columns=["plan_2026"])
+    reply = chat_answer("риск концентрации", combined, {"unit": 1000})
+    assert "нет колонки плана за год кампании" in reply
+
+
+def test_plain_risk_question_still_reaches_top_n(full_form):
+    """Non-regression for the narrowed trigger: "риск" with no supplier/
+    concentration wording still means "rank the priciest items"."""
+    meta, _, _, combined = full_form
+    reply = chat_answer("какие статьи в зоне риска", combined, meta)
+    assert reply is not None
+    assert reply.splitlines()[0] == "| Статья | Тип | Ветка | Сумма |"
+    assert "самых крупных статей по всему файлу." in reply
+
+
+def test_concentration_threshold_shared_with_narrator_bridge():
+    """The chat answer quotes the threshold back to the user; it must be the
+    same constant _concentration() flags on, not a second hardcoded 40."""
+    from core.budget_auditor import analysis, narrator_bridge
+
+    assert analysis._CONCENTRATION_THRESHOLD_PCT is narrator_bridge._CONCENTRATION_THRESHOLD_PCT
+
+
 # --- quarterly reconciliation flag ----------------------------------------------
 # Mirrors test_budget_audit.py's quarterly_reconciliation tests on the
 # budget_auditor schema: dynamic plan_<year>_qN columns, campaign year 2026.

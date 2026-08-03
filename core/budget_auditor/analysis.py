@@ -10,6 +10,11 @@ import re
 import pandas as pd
 
 from .parser import _best_baseline_col, year_trend, available_years
+from .narrator_bridge import (
+    _concentration,
+    _COMPOUND_COUNTERPARTY_LABEL,
+    _CONCENTRATION_THRESHOLD_PCT,
+)
 
 
 def normalize_unit(unit):
@@ -285,6 +290,41 @@ def _requested_top_n(q, default=5):
     return max(1, min(n, _MAX_TOP_N))
 
 
+# Supplier-concentration questions. Checked BEFORE the top-N branch and
+# excluded from its "риск" trigger below -- see _wants_top_n().
+_CONCENTRATION_TOKENS = (
+    "концентрац",
+    "зависимость от одного",
+    "зависим от одного",
+    "самый крупный поставщик",
+    "самый крупный контрагент",
+    "крупнейший поставщик",
+    "крупнейший контрагент",
+    "один поставщик",
+    "одного поставщика",
+)
+
+
+def _mentions_concentration(q):
+    return any(t in q for t in _CONCENTRATION_TOKENS)
+
+
+# Live bug: the top-N branch triggered on a bare "риск" substring, which also
+# matches "риск концентрации" -- so every supplier-concentration question was
+# silently hijacked into a Топ-5-most-expensive-items table, identically every
+# time. "риск" only means "rank the priciest items" when the question isn't
+# about suppliers; a concentration/supplier/counterparty risk question is a
+# different question with its own branch (_concentration_answer).
+_RISK_NOT_RANKING = ("концентрац", "поставщик", "контрагент")
+_EXPLICIT_RANKING_TOKENS = ("самые дорог", "самые крупн", "топ")
+
+
+def _wants_top_n(q):
+    if any(t in q for t in _EXPLICIT_RANKING_TOKENS):
+        return True
+    return "риск" in q and not any(t in q for t in _RISK_NOT_RANKING)
+
+
 # Bug #4 (routing): chat_answer()'s branches match on bare substrings with no
 # check that the matched branch actually covers the WHOLE question. A
 # question combining trigger words from more than one branch (a named-branch
@@ -298,7 +338,6 @@ def _requested_top_n(q, default=5):
 # out early instead, so chat_answer() returns None and app.py's existing
 # fallback chain (chat_answer -> answer_over_file -> FALLBACK_REPLY) routes
 # the question to the SQL/decomposition engine.
-_RANKING_TOKENS = ("самые дорог", "самые крупн", "топ", "риск")
 _COMPARISON_TOKENS = ("сравни", "сравнение")
 _CAPEX_OPEX_TOKENS = ("capex", "капекс", "капвлож", "opex", "опекс", "операционн")
 _BRANCH_GROUP_TOKENS = ("ветк", "филиал", "по дочк", "какая дочк", "branch")
@@ -332,7 +371,8 @@ def _looks_compound(q, combined_df):
         return True
 
     has_justification = "обоснован" in q
-    has_ranking = any(t in q for t in _RANKING_TOKENS)
+    has_ranking = _wants_top_n(q)
+    has_concentration = _mentions_concentration(q)
     has_comparison = any(t in q for t in _COMPARISON_TOKENS)
     has_capex_opex = any(t in q for t in _CAPEX_OPEX_TOKENS)
     has_branch_group = any(t in q for t in _BRANCH_GROUP_TOKENS)
@@ -350,7 +390,8 @@ def _looks_compound(q, combined_df):
     if has_comparison and has_capex_opex and has_branch_group:
         return True
 
-    matched_groups = sum([has_capex_opex, has_branch_group, has_justification, has_ranking])
+    matched_groups = sum([has_capex_opex, has_branch_group, has_justification,
+                          has_ranking, has_concentration])
     if matched_groups >= 2 and any(c in q for c in _COMPOUND_CONJUNCTIONS):
         return True
 
@@ -374,6 +415,62 @@ _REFORMAT_ONLY_TRIGGERS = (
 
 def _is_reformat_only_request(q: str) -> bool:
     return any(t in q for t in _REFORMAT_ONLY_TRIGGERS)
+
+
+def _concentration_answer(combined_df, unit):
+    """Supplier-concentration answer over the whole file: who the biggest
+    supplier is, its share of the campaign-year plan, and whether that clears
+    the concentration threshold.
+
+    The math is delegated to narrator_bridge._concentration() rather than
+    recomputed here so the compound-counterparty rule can't drift between the
+    two paths: a cell naming several suppliers ("ТОО Альфа, АО Бета") is
+    grouped under its own label and can never BE the top supplier, since
+    attributing its combined amount to "one supplier" would invent a risk
+    finding for a company that doesn't exist.
+    """
+    plan_year = (
+        combined_df["plan_year"].dropna().iloc[0]
+        if "plan_year" in combined_df.columns and combined_df["plan_year"].notna().any()
+        else None
+    )
+    plan_col = f"plan_{plan_year}" if plan_year else None
+    if not plan_col or plan_col not in combined_df.columns:
+        return ("В файле нет колонки плана за год кампании, поэтому долю поставщиков "
+                "посчитать не от чего.")
+
+    plan = pd.to_numeric(combined_df[plan_col], errors="coerce").fillna(0)
+    conc = _concentration(combined_df, plan)
+    breakdown = conc["supplier_breakdown"]
+    if breakdown.empty:
+        return ("Контрагенты в этом файле не заполнены (или сумма плана нулевая) -- "
+                "оценить концентрацию по поставщикам по этим данным нельзя.")
+
+    rows = [
+        [r.counterparty, format_money(r.total_amount, unit), f"{r.share_pct:.1f}%"]
+        for r in breakdown.head(10).itertuples()
+    ]
+    table = _as_markdown_table(["Контрагент", "Сумма", "Доля %"], rows)
+
+    if not conc["top_supplier"]:
+        return table + (
+            "\n\nНи одну строку нельзя отнести к одному поставщику: в каждой "
+            "заполненной ячейке контрагента указано несколько компаний. Считать "
+            "это концентрацией на одном поставщике было бы неверно."
+        )
+
+    verdict = "превышает" if conc["concentration_flag"] else "не превышает"
+    note = (
+        f"\n\nКрупнейший контрагент -- {conc['top_supplier']}: "
+        f"{conc['top_supplier_pct']:.1f}% плана на {plan_year} год. "
+        f"Это {verdict} порог концентрации в {_CONCENTRATION_THRESHOLD_PCT}%."
+    )
+    if (breakdown["counterparty"] == _COMPOUND_COUNTERPARTY_LABEL).any():
+        note += (
+            " Строки, где в одной ячейке указано несколько контрагентов, сведены "
+            "отдельно и не приписаны ни одному поставщику."
+        )
+    return table + note
 
 
 def answer_query(question, df, stats, meta):
@@ -402,7 +499,7 @@ def answer_query(question, df, stats, meta):
         names = ", ".join(missing["item_name"].astype(str).head(10))
         return f"{len(missing)} статей без обоснования: {names}{'...' if len(missing) > 10 else ''}."
 
-    if any(w in q for w in ["самые дорог", "самые крупн", "топ", "риск"]):
+    if _wants_top_n(q):
         plan_col = f"plan_{stats['plan_year']}"
         if plan_col not in df.columns:
             return "Нет данных плана для ранжирования."
@@ -540,7 +637,12 @@ def chat_answer(question, combined_df, meta):
             + f"\n\nВсего без обоснования: {len(missing)} статей."
         )
 
-    if any(w in q for w in ["самые дорог", "самые крупн", "топ", "риск"]):
+    # Checked BEFORE the top-N branch: "риск концентрации" used to fall into
+    # it on the bare "риск" substring and come back as a Топ-5 items table.
+    if _mentions_concentration(q):
+        return _concentration_answer(combined_df, unit)
+
+    if _wants_top_n(q):
         n = _requested_top_n(q)
         col = year_col or plan_col
         top = combined_df.nlargest(n, col)[["item_name", "cost_type", "branch", col]]

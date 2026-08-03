@@ -50,6 +50,11 @@ logger = logging.getLogger(__name__)
 _LEGAL_MARKER_RE = re.compile(r"\b(?:ТОО|АО|ИП|ЧП)\b")
 _COMPOUND_COUNTERPARTY_LABEL = "несколько контрагентов в одной строке"
 
+# Share of the campaign-year plan above which one supplier counts as a
+# concentration risk. Named (not inlined) because analysis.py's chat answer
+# quotes the same threshold back to the user -- the two must not drift.
+_CONCENTRATION_THRESHOLD_PCT = 40
+
 
 def _is_compound_counterparty(name) -> bool:
     if name is None:
@@ -226,7 +231,7 @@ def _concentration(combined: pd.DataFrame, plan: pd.Series) -> dict:
     return {
         "top_supplier": str(real.iloc[0]["counterparty"]),
         "top_supplier_pct": float(real.iloc[0]["share_pct"]),
-        "concentration_flag": bool((real["share_pct"] > 40).any()),
+        "concentration_flag": bool((real["share_pct"] > _CONCENTRATION_THRESHOLD_PCT).any()),
         "supplier_breakdown": breakdown,
     }
 
