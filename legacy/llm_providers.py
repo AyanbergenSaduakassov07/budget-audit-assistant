@@ -16,13 +16,9 @@ implementation, just a different set of constructor arguments.
 
 OpenRouterProvider implements a retry/backoff policy (_RETRY_STATUS,
 _MAX_ATTEMPTS, _BASE_DELAY_S) and raises DailyQuotaExhausted on a
-non-retryable daily-quota 429. The daily-quota markers below
-(_DAILY_QUOTA_MARKERS) are a historically observed quota-exhaustion wording
-("PerDay" / "RPD" quota IDs), not yet confirmed against a live OpenRouter
-daily-quota response, so an OpenRouter 429 that doesn't match these markers
-is retried like any other transient error and eventually raised as a plain
-openai.APIStatusError rather than DailyQuotaExhausted. Adjust
-_DAILY_QUOTA_MARKERS once real OpenRouter quota-error text is seen.
+non-retryable daily-quota 429. Detection reads the parsed JSON error body
+(error.metadata.limit_source) rather than pattern-matching the message text;
+see _is_daily_quota_error for the real response this was confirmed against.
 """
 
 from __future__ import annotations
@@ -40,7 +36,16 @@ logger = logging.getLogger(__name__)
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _MAX_ATTEMPTS = 5
 _BASE_DELAY_S = 2.0
-_DAILY_QUOTA_MARKERS = ("PerDay", "per_day", "RPD")
+# Message-text markers, used only when the response carried no parseable JSON
+# body. "free-models-per-day" is OpenRouter's own wording; the other three are
+# historically observed quota-ID spellings kept for other OpenAI-compatible
+# endpoints (LOCAL_LLM_BASE_URL can point anywhere).
+_DAILY_QUOTA_MARKERS = ("PerDay", "per_day", "RPD", "free-models-per-day")
+
+# The single user-facing sentence for this failure. Shared by every caller
+# that catches DailyQuotaExhausted so the wording can't drift between the
+# chat fallback, the narrative opening, and the warehouse query path.
+DAILY_QUOTA_MESSAGE = "Дневной лимит бесплатного API исчерпан. Попробуйте позже."
 
 # Some OpenRouter models (observed with Qwen3.6) run an integrated
 # reasoning/"thinking" pass that consumes output tokens before the visible
@@ -100,11 +105,50 @@ class LLMProvider(Protocol):
     def generate_json(self, prompt: str) -> str: ...
 
 
-def _is_daily_quota_error(status_code: int | None, message: str) -> bool:
-    """True if a 429 is a per-day quota exhaustion (vs. a per-minute rate limit)."""
-    if status_code != 429:
+def _daily_quota_limit_source(exc: object) -> str:
+    """error.metadata.limit_source out of an APIStatusError's parsed JSON
+    body, or "" when the response wasn't JSON (openai leaves .body as None or
+    the raw text) or didn't carry that field."""
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return ""
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return ""
+    metadata = error.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    source = metadata.get("limit_source")
+    return source if isinstance(source, str) else ""
+
+
+def _is_daily_quota_error(exc: object) -> bool:
+    """True if a 429 is a per-day quota exhaustion (vs. a per-minute rate
+    limit), which is not retryable until the daily reset.
+
+    Confirmed against a live OpenRouter daily-quota 429 (2026-08-03):
+
+        {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add
+         10 credits to unlock 1000 free model requests per day', 'code': 429,
+         'metadata': {'limit_source': 'openrouter_free_tier_daily', ...}}}
+
+    The previous check matched str(exc) against ("PerDay", "per_day", "RPD")
+    -- none of which appear in that text -- so a genuine daily quota-out fell
+    through to the transient-429 path and burned 5 attempts with exponential
+    backoff (~62s) on a request that could not succeed, then surfaced as a
+    plain APIStatusError the caller showed as a generic "не нашёл точного
+    ответа", indistinguishable from a real reasoning failure.
+
+    metadata.limit_source is authoritative when present: a structured
+    per-minute source means retrying IS the right move, so the message-text
+    markers are consulted only when there's no parseable JSON body at all.
+    """
+    if getattr(exc, "status_code", None) != 429:
         return False
-    return any(marker in message for marker in _DAILY_QUOTA_MARKERS)
+    source = _daily_quota_limit_source(exc)
+    if source:
+        return "daily" in source.lower()
+    return any(marker in str(exc) for marker in _DAILY_QUOTA_MARKERS)
 
 
 def _log_call(model: str, started_at: float, response, attempt: int) -> None:
@@ -157,7 +201,7 @@ class OpenRouterProvider:
                 return content
             except openai.APIStatusError as exc:
                 latency_ms = (time.perf_counter() - started_at) * 1000
-                if _is_daily_quota_error(exc.status_code, str(exc)):
+                if _is_daily_quota_error(exc):
                     logger.info(
                         "LLM call failed timestamp=%s model=%s attempt=%d "
                         "latency_ms=%.1f outcome=daily_quota_exhausted",

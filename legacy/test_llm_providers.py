@@ -17,6 +17,8 @@ from legacy.llm_providers import (
     OpenRouterProvider,
     _OPENROUTER_MAX_OUTPUT_TOKENS,
     _OPENROUTER_REASONING_EXTRA_BODY,
+    _daily_quota_limit_source,
+    _is_daily_quota_error,
     get_provider,
 )
 
@@ -285,6 +287,142 @@ def test_complete_gives_up_after_max_attempts_of_connection_errors(monkeypatch):
 
     with pytest.raises(openai.APIConnectionError):
         provider._complete("prompt")
+
+
+# --- daily-quota 429 detection ----------------------------------------------------
+# The real OpenRouter daily-quota response, captured live 2026-08-03. The old
+# check matched str(exc) against ("PerDay", "per_day", "RPD") -- none of which
+# appear anywhere in this text -- so a genuine quota-out fell through to the
+# transient-429 path: 5 attempts with exponential backoff (~62s) on a request
+# that could not succeed, then a plain APIStatusError the caller showed as a
+# generic "не нашёл точного ответа".
+_REAL_DAILY_QUOTA_BODY = {
+    "error": {
+        "message": (
+            "Rate limit exceeded: free-models-per-day. Add 10 credits to "
+            "unlock 1000 free model requests per day"
+        ),
+        "code": 429,
+        "metadata": {
+            "headers": {
+                "X-RateLimit-Limit": "50",
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "1785801600000",
+            },
+            "limit_source": "openrouter_free_tier_daily",
+            "provider_name": None,
+        },
+        "user_id": "user_3EmUkUQsYGGE8fNJQnshpTypYz4",
+    }
+}
+
+
+def _status_error(status_code: int, body, message: str = "Error") -> openai.APIStatusError:
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(status_code, request=request, json=body)
+    return openai.APIStatusError(message, response=response, body=body)
+
+
+def test_real_openrouter_daily_quota_body_is_detected():
+    exc = _status_error(429, _REAL_DAILY_QUOTA_BODY)
+    # None of the legacy message markers appear in this response...
+    assert "PerDay" not in str(exc) and "RPD" not in str(exc)
+    # ...but metadata.limit_source identifies it structurally.
+    assert _daily_quota_limit_source(exc) == "openrouter_free_tier_daily"
+    assert _is_daily_quota_error(exc) is True
+
+
+def test_real_daily_quota_raises_immediately_with_zero_retries(monkeypatch):
+    """The whole point of the fix: no backoff on a request that cannot
+    succeed until the daily reset."""
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            raise _status_error(429, _REAL_DAILY_QUOTA_BODY)
+
+    fake_client = _FakeClient()
+    provider = _provider(fake_client)
+
+    slept = []
+    monkeypatch.setattr("legacy.llm_providers.time.sleep", lambda s: slept.append(s))
+
+    with pytest.raises(DailyQuotaExhausted):
+        provider._complete("prompt")
+
+    assert fake_client.calls == 1  # first attempt, not 5
+    assert slept == []             # no exponential backoff burned
+
+
+def test_per_minute_429_is_still_retried(monkeypatch):
+    """A structured per-minute limit_source means retrying IS correct --
+    the fix must not turn every 429 into a hard stop."""
+    body = {
+        "error": {
+            "message": "Rate limit exceeded: free-models-per-min",
+            "code": 429,
+            "metadata": {"limit_source": "openrouter_free_tier_per_minute"},
+        }
+    }
+    exc = _status_error(429, body)
+    assert _is_daily_quota_error(exc) is False
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise _status_error(429, body)
+            return _completion("recovered")
+
+    fake_client = _FakeClient()
+    provider = _provider(fake_client)
+    monkeypatch.setattr("legacy.llm_providers.time.sleep", lambda *_a, **_k: None)
+
+    assert provider._complete("prompt") == "recovered"
+    assert fake_client.calls == 2
+
+
+def test_message_markers_still_used_without_a_json_body():
+    """Non-JSON error responses (openai leaves .body as None or raw text)
+    fall back to the message markers -- LOCAL_LLM_BASE_URL can point at any
+    OpenAI-compatible endpoint, which need not use OpenRouter's shape."""
+    request = httpx.Request("POST", "https://internal/chat/completions")
+    response = httpx.Response(429, request=request, text="RPD quota exceeded")
+    exc = openai.APIStatusError("RPD quota exceeded", response=response, body=None)
+    assert _daily_quota_limit_source(exc) == ""
+    assert _is_daily_quota_error(exc) is True
+
+    plain = openai.APIStatusError(
+        "Too Many Requests",
+        response=httpx.Response(429, request=request, text="slow down"),
+        body=None,
+    )
+    assert _is_daily_quota_error(plain) is False
+
+
+def test_non_429_status_is_never_a_quota_error():
+    assert _is_daily_quota_error(_status_error(500, _REAL_DAILY_QUOTA_BODY)) is False
+
+
+def test_daily_quota_limit_source_tolerates_malformed_bodies():
+    """A JSON body of an unexpected shape must not raise -- it just means no
+    structured signal, so the message markers decide."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    for body in (None, [], "text", {}, {"error": "boom"}, {"error": {"metadata": None}}):
+        exc = openai.APIStatusError(
+            "Error", response=httpx.Response(429, request=request, text="x"), body=body
+        )
+        assert _daily_quota_limit_source(exc) == ""
 
 
 # --- get_provider() selection: OpenRouter or an internal endpoint ---------------

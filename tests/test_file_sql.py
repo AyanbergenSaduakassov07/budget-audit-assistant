@@ -12,6 +12,7 @@ import os
 
 import openpyxl
 
+from legacy.llm_providers import DAILY_QUOTA_MESSAGE
 from legacy.query_engine import _SQL_EXAMPLES
 
 import core.budget_auditor.file_sql as file_sql
@@ -286,18 +287,23 @@ def test_returns_none_on_empty_or_no_money(tmp_path, monkeypatch):
     assert answer_over_file("что угодно", no_money, {}) is None
 
 
-def test_returns_none_on_quota_exhausted(tmp_path, monkeypatch):
+def test_quota_exhausted_surfaces_a_distinct_message(tmp_path, monkeypatch):
+    """Quota exhaustion must NOT return None like every other failure: the
+    caller's generic not-found reply ("не нашёл точного ответа") made an
+    out-of-quota day indistinguishable from a real reasoning failure."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
 
     class _FakeProvider:
         def generate_json(self, prompt):
-            raise file_sql.DailyQuotaExhausted("PerDay limit")
+            raise file_sql.DailyQuotaExhausted("free-models-per-day")
 
         def generate_sql(self, prompt):
-            raise file_sql.DailyQuotaExhausted("PerDay limit")
+            raise file_sql.DailyQuotaExhausted("free-models-per-day")
 
     monkeypatch.setattr(file_sql, "_get_client", lambda: _FakeProvider())
-    assert answer_over_file("сравни года", _subsidiary_b(tmp_path), {"unit": 1000}) is None
+    reply = answer_over_file("сравни года", _subsidiary_b(tmp_path), {"unit": 1000})
+    assert reply == DAILY_QUOTA_MESSAGE
+    assert "лимит" in reply and "позже" in reply
 
 
 def test_returns_none_when_step_loop_and_forced_synthesis_both_fail(tmp_path, monkeypatch, caplog):

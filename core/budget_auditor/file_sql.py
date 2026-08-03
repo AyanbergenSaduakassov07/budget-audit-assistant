@@ -35,6 +35,7 @@ import tempfile
 import pandas as pd
 
 from legacy import warehouse
+from legacy.llm_providers import DAILY_QUOTA_MESSAGE
 from legacy.query_engine import (
     DailyQuotaExhausted,
     _generate_sql_with_error_feedback,
@@ -549,9 +550,14 @@ def answer_over_file(
     raw data, so this doesn't touch the existing data-minimization boundary.
 
     Returns the Russian answer string, or None on ANY failure (missing key,
-    quota, empty data, no numeric columns, the step loop never producing an
-    answer) -- the caller then shows its existing not-found message. Never
-    raises.
+    empty data, no numeric columns, the step loop never producing an answer)
+    -- the caller then shows its existing not-found message. Never raises.
+
+    Daily quota exhaustion is the one failure that does NOT return None: it
+    returns DAILY_QUOTA_MESSAGE. "Out of quota until tomorrow" and "I looked
+    and couldn't answer that" are different things to tell a user, and
+    collapsing both into the caller's generic not-found reply is how a
+    quota-out spent months looking like a reasoning failure.
     """
     try:
         if combined is None or combined.empty:
@@ -570,7 +576,8 @@ def answer_over_file(
         schema = _schema_description(combined, meta or {}, dims, money, flags)
         return _answer_via_step_loop(client, question, schema, db_path, history)
     except DailyQuotaExhausted:
-        return None
+        logger.info("file SQL fallback stopped: daily quota exhausted")
+        return DAILY_QUOTA_MESSAGE
     except Exception:
         logger.exception("file SQL fallback failed for question: %s", question)
         return None

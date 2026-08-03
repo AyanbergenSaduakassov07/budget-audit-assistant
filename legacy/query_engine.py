@@ -25,7 +25,12 @@ import json
 import re
 
 from legacy import warehouse
-from legacy.llm_providers import DailyQuotaExhausted, LLMProvider, get_provider
+from legacy.llm_providers import (
+    DAILY_QUOTA_MESSAGE,
+    DailyQuotaExhausted,
+    LLMProvider,
+    get_provider,
+)
 
 
 def _get_client() -> LLMProvider:
@@ -531,7 +536,7 @@ def answer(question: str, db_path: str = "procurement.db") -> dict:
         result["answer"] = _phrase_answer(client, question, sql, result_text, empty=df.empty)
         return result
     except DailyQuotaExhausted:
-        message = "Дневной лимит бесплатного API исчерпан. Попробуйте позже."
+        message = DAILY_QUOTA_MESSAGE
         result["error"] = message
         result["answer"] = message
         return result

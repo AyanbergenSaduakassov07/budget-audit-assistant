@@ -21,6 +21,7 @@ import math
 
 import pandas as pd
 
+from legacy.llm_providers import DAILY_QUOTA_MESSAGE
 from legacy.query_engine import (
     DailyQuotaExhausted,
     _FORMATTING_INSTRUCTION,
@@ -192,10 +193,7 @@ def narrate_audit(audit_result: dict) -> dict:
         raw_text = _generate_content(client, prompt)
         narrative = _parse_narrative(raw_text)
     except DailyQuotaExhausted:
-        narrative = {
-            **_FALLBACK_NARRATIVE,
-            "error": "Дневной лимит бесплатного API исчерпан. Попробуйте позже.",
-        }
+        narrative = {**_FALLBACK_NARRATIVE, "error": DAILY_QUOTA_MESSAGE}
     except Exception as exc:  # never crash the audit pipeline on a narration failure
         narrative = {
             **_FALLBACK_NARRATIVE,
