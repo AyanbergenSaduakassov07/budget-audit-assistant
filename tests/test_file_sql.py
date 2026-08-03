@@ -103,6 +103,58 @@ def test_schema_description_grounds_the_model(tmp_path):
     assert "OPEX" in schema  # exact cost_type value listed
 
 
+# --- workbook metadata in the prompt --------------------------------------------
+# Live bug: parser.py reads company/campaign_year/currency/unit/version off the
+# form's header, but none of it reached the model -- only the table's rows did.
+# So "какая это компания" had nothing to ground on and came back with a
+# confidently invented, unrelated company name.
+def test_schema_description_includes_workbook_metadata(tmp_path):
+    combined = _subsidiary_b(tmp_path)
+    dims, money = _split_columns(combined)
+    flags = _split_flag_columns(combined)
+    meta = {
+        "company": "ТОО Тест-Дочка",
+        "campaign_year": 2027,
+        "currency": "KZT",
+        "unit": 1000,
+        "version": "план",
+    }
+    schema = _schema_description(combined, meta, dims, money, flags)
+
+    assert "Компания: ТОО Тест-Дочка" in schema
+    assert "Год кампании: 2027" in schema
+    assert "Валюта: KZT" in schema
+    assert "Единица измерения: тыс. тенге" in schema
+    assert "Версия формы: план" in schema
+    # ...and the instruction not to derive these from the table's rows.
+    assert "не придумывайте" in schema
+
+
+def test_schema_description_metadata_survives_the_real_parsed_meta(tmp_path):
+    """The parsed meta dict, not a hand-built one -- guards against a key
+    rename in parser.py silently emptying the block."""
+    meta, _, _, combined = _run_pipeline(_full_form_workbook(tmp_path / "meta.xlsx"))
+    dims, money = _split_columns(combined)
+    flags = _split_flag_columns(combined)
+    schema = _schema_description(combined, meta, dims, money, flags)
+
+    assert meta["company"] in schema
+    assert f"Год кампании: {meta['campaign_year']}" in schema
+
+
+def test_schema_description_marks_missing_metadata_as_missing(tmp_path):
+    """A field the form doesn't carry is spelled out as missing rather than
+    omitted -- a blank line is an invitation to guess."""
+    combined = _subsidiary_b(tmp_path)
+    dims, money = _split_columns(combined)
+    flags = _split_flag_columns(combined)
+    schema = _schema_description(combined, {"unit": 1000}, dims, money, flags)
+
+    assert "Компания: не указано в форме" in schema
+    assert "Валюта: не указано в форме" in schema
+    assert "None" not in schema  # never a raw Python None leaking into the prompt
+
+
 def test_flag_columns_exposed_in_schema_and_filterable(tmp_path):
     """Pre-computed anomaly flags must reach the SQL layer instead of being
     discarded: the schema text must mention quarterly_mismatch_flag (telling

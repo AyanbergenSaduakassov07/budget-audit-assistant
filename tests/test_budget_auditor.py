@@ -797,6 +797,78 @@ def test_table_cells_escape_pipes():
     assert _table_rows(reply)[0][0] == "ГО|АФ"  # ...and still one cell when parsed
 
 
+# --- company / file identity -----------------------------------------------------
+# Live bug: with no branch for it, "какая это компания" fell through to the LLM
+# SQL fallback, which has no company column to query and returned a
+# confidently invented, unrelated company name. It's a pure metadata lookup
+# with one correct answer sitting in meta["company"] -- answered here so the
+# LLM is never reached for it.
+def _identity_df():
+    return pd.DataFrame({
+        "branch": ["ГО"],
+        "cost_type": ["OPEX"],
+        "item_name": ["Услуги связи"],
+        "category": ["Связь"],
+        "subcategory": [None],
+        "counterparty": ["ТОО Альфа"],
+        "plan_year": [2026],
+        "plan_2026": [1000.0],
+    })
+
+
+def test_company_identity_answered_from_meta():
+    combined = _identity_df()
+    meta = {"unit": 1000, "company": "ТОО Тест-Дочка"}
+    for question in [
+        "какая компания",
+        "какая это компания",
+        "что за компания",
+        "название компании",
+        "чья это форма",
+        "чей файл",
+    ]:
+        reply = chat_answer(question, combined, meta)
+        assert reply == "Компания: ТОО Тест-Дочка (из шапки загруженной формы).", question
+
+
+def test_company_identity_falls_back_explicitly_when_meta_has_no_company():
+    """parser.py leaves company None when the form's header doesn't name it --
+    a real structural gap. Say so; never guess."""
+    combined = _identity_df()
+    for company in (None, "", "   "):
+        reply = chat_answer("какая это компания", combined, {"unit": 1000, "company": company})
+        assert reply == "Компания: не определена по данным формы.", company
+    # key absent entirely, not just None
+    assert chat_answer("чья это форма", combined, {"unit": 1000}) == (
+        "Компания: не определена по данным формы."
+    )
+
+
+def test_company_identity_answered_from_real_parsed_meta(full_form):
+    meta, _, _, combined = full_form
+    reply = chat_answer("какая это компания", combined, meta)
+    assert reply == f"Компания: {meta['company']} (из шапки загруженной формы)."
+
+
+def test_company_identity_never_reaches_the_token_search(full_form):
+    """The token-search branch would match item names containing "компани" and
+    answer with a spend total instead. The identity branch runs first."""
+    meta, _, _, combined = full_form
+    reply = chat_answer("какая это компания", combined, meta)
+    assert "Найдено" not in reply
+    assert "Суммарно" not in reply
+
+
+def test_spending_question_mentioning_company_is_not_hijacked(full_form):
+    """"компания" as a bare word in a spend question must NOT trigger the
+    identity branch -- the triggers are phrases, not the noun alone."""
+    meta, _, _, combined = full_form
+    reply = chat_answer("сколько всего потратила компания в 2026 году", combined, meta)
+    assert reply is not None
+    assert not reply.startswith("Компания:")
+    assert "17 000" in reply
+
+
 # --- supplier concentration ------------------------------------------------------
 # Live bug: the top-N branch triggered on a bare "риск" substring, which also
 # matches "риск концентрации" -- so every concentration question came back as

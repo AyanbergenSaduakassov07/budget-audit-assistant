@@ -276,6 +276,30 @@ def _structural_notes(combined: pd.DataFrame, meta: dict, dims: list[str], money
     return "\n".join(notes)
 
 
+def _meta_block(meta: dict, unit_label: str) -> str:
+    """Workbook header metadata (company, campaign year, currency, unit,
+    version) as prompt text.
+
+    parser.py reads all of this off the form's header, but none of it used to
+    reach the model -- only the table's rows did. So a pure metadata question
+    ("какая это компания") had nothing to ground on and came back with a
+    confidently invented company name. Values missing from the form are
+    spelled out as missing rather than omitted, so the model can't read a
+    blank line as an invitation to guess."""
+    fields = [
+        ("Компания", meta.get("company")),
+        ("Год кампании", meta.get("campaign_year")),
+        ("Валюта", meta.get("currency")),
+        ("Единица измерения", unit_label),
+        ("Версия формы", meta.get("version")),
+    ]
+    lines = []
+    for label, value in fields:
+        text = str(value).strip() if value is not None else ""
+        lines.append(f"  - {label}: {text or 'не указано в форме'}")
+    return "\n".join(lines)
+
+
 def _schema_description(
     combined: pd.DataFrame, meta: dict, dims: list[str], money: list[str],
     flags: list[str],
@@ -312,11 +336,17 @@ def _schema_description(
     dim_block = "\n".join(dim_lines[c] for c in dims if c in dim_lines)
     flag_block = "\n".join(_FLAG_DESCRIPTIONS[c] for c in flags if c in _FLAG_DESCRIPTIONS) or "  (нет)"
     structural_notes = _structural_notes(combined, meta, dims, money)
+    meta_block = _meta_block(meta, unit_label)
 
     return f"""\
 Table: {_TABLE}
 Плоская таблица одного загруженного файла ИТ-бюджета компании. Одна строка = одна
 статья расхода одного листа/подразделения. Все суммы уже в {unit_label}.
+
+Метаданные файла (из шапки формы, НЕ из таблицы — это и есть ответ на вопросы
+«какая это компания», «чья форма», «за какой год»; берите значения дословно
+отсюда, не выводите их из данных и не придумывайте):
+{meta_block}
 
 Dimension columns (TEXT):
 {dim_block}

@@ -417,6 +417,36 @@ def _is_reformat_only_request(q: str) -> bool:
     return any(t in q for t in _REFORMAT_ONLY_TRIGGERS)
 
 
+# "Whose form is this / what company" -- a pure metadata lookup with a single
+# correct answer sitting in meta["company"]. Live bug: with no branch for it,
+# the question fell through to the LLM SQL fallback, which has no company
+# column to query and returned a confidently invented, unrelated company name.
+# Answered deterministically here so the LLM is never reached for it. (The
+# same metadata is also passed to the SQL layer's schema prompt now, for the
+# phrasings this list doesn't cover.)
+_COMPANY_IDENTITY_TRIGGERS = (
+    "какая компания", "какая это компания", "что за компания", "чья компания",
+    "название компании", "наименование компании", "как называется компания",
+    "чья это форма", "чья форма", "чей файл", "чей это файл",
+    "какая организация", "что за организация", "какое предприятие",
+)
+
+
+def _mentions_company_identity(q):
+    return any(t in q for t in _COMPANY_IDENTITY_TRIGGERS)
+
+
+def _company_identity_answer(meta):
+    """meta["company"] verbatim, or an explicit "not determinable" -- never a
+    guess. parser.py leaves this None when the form's header doesn't name the
+    company, which is a real and common structural gap, not an error."""
+    company = meta.get("company")
+    company = str(company).strip() if company is not None else ""
+    if not company:
+        return "Компания: не определена по данным формы."
+    return f"Компания: {company} (из шапки загруженной формы)."
+
+
 def _concentration_answer(combined_df, unit):
     """Supplier-concentration answer over the whole file: who the biggest
     supplier is, its share of the campaign-year plan, and whether that clears
@@ -575,6 +605,13 @@ def chat_answer(question, combined_df, meta):
         return None
     if _is_reformat_only_request(q):
         return None
+
+    # Checked before anything that touches the data: the answer is a metadata
+    # lookup, and letting it reach either the token-search branch (item names
+    # containing "компани") or the LLM SQL fallback is how it started coming
+    # back as an invented company name.
+    if _mentions_company_identity(q):
+        return _company_identity_answer(meta)
 
     unit = meta.get("unit", "")
     plan_year = combined_df["plan_year"].dropna().iloc[0] if combined_df["plan_year"].notna().any() else None
