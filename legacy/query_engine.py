@@ -206,6 +206,7 @@ def synthesize_answer(
         "ниже — ничего не выдумывай. Суммы в тенге (KZT). "
         + _NUMBER_FORMAT_INSTRUCTION
         + " " + _FORMATTING_INSTRUCTION
+        + " " + _TABLE_FORMAT_INSTRUCTION
         + "\n\n"
         f"{_format_history(history)}"
         f"Исходный вопрос: {original_question}\n\n"
@@ -237,6 +238,21 @@ _FORMATTING_INSTRUCTION = (
     "Пиши официальным деловым языком, без эмодзи и любых декоративных "
     "символов, без markdown-разметки (никаких **, *, -, # для форматирования) "
     "— обычным связным текстом, как в официальном документе."
+)
+
+# Single-value and short-list answers should stay prose (_FORMATTING_INSTRUCTION
+# above), but a multi-year or multi-item comparison crammed into one paragraph
+# is unreadable ("2025 (Факт): OPEX = ..., CAPEX = ...; 2026 (План): OPEX = ...
+# " repeated seven times run-on). Used only by synthesize_answer/next_step
+# (compound, multi-row answers) -- not _phrase_answer (usually a single
+# number) or the narrator's executive_summary (meant to stay short prose).
+_TABLE_FORMAT_INSTRUCTION = (
+    "Единственное исключение из запрета на markdown выше: если ответ "
+    "сравнивает 3 и более однотипных строк (несколько лет, несколько статей, "
+    "план/факт/прогноз по годам и т.п.), оформи это как markdown-таблицу — "
+    "строка заголовков, строка-разделитель (|---|---|), затем строки данных, "
+    "с отдельной колонкой на Δ % там, где применимо. Если сравниваются меньше "
+    "3 строк или ответ — одно число, пиши обычным предложением без таблицы."
 )
 
 # Second line of defense: strip decorative characters a model produced anyway,
@@ -361,7 +377,8 @@ def _build_step_prompt(
         "данных уже достаточно — дай итоговый ответ на русском, кратко, "
         "указав конкретные числа. Используй ТОЛЬКО числа из результатов "
         "запросов выше — ничего не выдумывай. Суммы в тенге (KZT). "
-        + _NUMBER_FORMAT_INSTRUCTION + " " + _FORMATTING_INSTRUCTION + "\n\n"
+        + _NUMBER_FORMAT_INSTRUCTION + " " + _FORMATTING_INSTRUCTION
+        + " " + _TABLE_FORMAT_INSTRUCTION + "\n\n"
         "Верни ТОЛЬКО валидный JSON без markdown-ограждений (без ```), без "
         "пояснений до или после, ОДНОЙ из двух структур:\n"
         '{"action": "query", "sql": "<один SQLite SELECT>", '

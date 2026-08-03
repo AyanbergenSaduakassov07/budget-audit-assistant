@@ -317,6 +317,30 @@ def test_chat_answer_compound_bailout_prevents_partial_branch_comparison():
     assert reply is None
 
 
+def test_chat_answer_bails_out_on_reformat_only_followup():
+    """Live bug: "в виде таблицы" as a follow-up carries no business keyword
+    of its own -- chat_answer() is stateless and can't know it means "reformat
+    the previous answer". Tokenizing it ("виде", "таблицы") for the generic
+    keyword-search fallback produced a coincidental substring match against
+    item names containing "телевидения" ("виде" is a substring of "видения"),
+    returning an unrelated top-items list. Must bail to None instead, so
+    app.answer_question() routes to the history-aware LLM fallback."""
+    combined = pd.DataFrame({
+        "branch": ["(головная)"],
+        "cost_type": ["OPEX"],
+        "item_name": ["Услуги кабельного телевидения"],
+        "category": ["Связь"],
+        "subcategory": [None],
+        "counterparty": [None],
+        "plan_year": [2027],
+        "plan_2027": [15890.0],
+    })
+    meta = {"unit": 1000}
+    assert chat_answer("в виде таблицы", combined, meta) is None
+    assert chat_answer("покажи списком", combined, meta) is None
+    assert chat_answer("сколько CAPEX в 2027", combined, meta) is not None  # unaffected
+
+
 # --- multi-year OPEX/CAPEX breakdown ("...по всем годам" / "...за все года") ----
 def _multi_year_workbook(path):
     """OPEX + CAPEX sheets sharing campaign year 2027, each carrying three

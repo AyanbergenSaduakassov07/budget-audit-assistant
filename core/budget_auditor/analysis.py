@@ -321,6 +321,25 @@ def _looks_compound(q, combined_df):
     return False
 
 
+# A short "reformat what you just showed me" follow-up ("в виде таблицы",
+# "покажи списком") carries no business keyword of its own. chat_answer() is
+# stateless -- it has no idea what "it" refers to -- so letting one of these
+# reach the generic keyword-search fallback below risks a coincidental
+# substring match (observed live: "в виде таблицы" tokenizes to "виде" +
+# "таблицы", and "виде" matched unrelated item names containing "видения",
+# e.g. "Услуги кабельного телевидения"). Bail out to None here so the caller
+# (app.answer_question) routes straight to the history-aware LLM fallback,
+# which at least has the prior answer to reformat.
+_REFORMAT_ONLY_TRIGGERS = (
+    "в виде таблиц", "таблицей", "в таблице", "списком", "по-другому",
+    "по другому", "переформат", "в виде списка", "построчно",
+)
+
+
+def _is_reformat_only_request(q: str) -> bool:
+    return any(t in q for t in _REFORMAT_ONLY_TRIGGERS)
+
+
 def answer_query(question, df, stats, meta):
     """Deterministic keyword/year/regex based Q&A over one parsed sheet.
     Covers: 'бюджет на <year>', 'сколько потратили на <keyword>',
@@ -413,6 +432,8 @@ def chat_answer(question, combined_df, meta):
 
     q = question.lower().strip()
     if _looks_compound(q, combined_df):
+        return None
+    if _is_reformat_only_request(q):
         return None
 
     unit = meta.get("unit", "")

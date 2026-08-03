@@ -237,6 +237,24 @@ def test_synthesize_answer_prompt_includes_formatting_instruction():
     assert "без эмодзи" in captured["prompt"]
 
 
+def test_synthesize_answer_prompt_includes_table_format_instruction():
+    """A multi-year/multi-row comparison crammed into one paragraph is the
+    exact complaint this instruction addresses -- must reach the model."""
+    captured = {}
+
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            captured["prompt"] = prompt
+            return "500 000 тенге"
+
+        def generate_sql(self, prompt):
+            return ""
+
+    synthesize_answer(_FakeProvider(), "Вопрос", [("Подвопрос", "SELECT 1", "500000")])
+    assert "markdown-таблицу" in captured["prompt"]
+    assert "3 и более" in captured["prompt"]
+
+
 # --- next_step() / self_check_answer(): the bounded step loop's primitives ------
 def test_next_step_parses_query_action():
     class _FakeProvider:
@@ -312,6 +330,33 @@ def test_next_step_prompt_includes_formatting_instruction():
     next_step(_FakeProvider(), "Вопрос", "Table: t", scratchpad=[])
     assert "без эмодзи" in captured["prompt"]
     assert "markdown" in captured["prompt"]
+
+
+def test_next_step_prompt_includes_table_format_instruction():
+    captured = {}
+
+    class _FakeProvider:
+        def generate_json(self, prompt):
+            captured["prompt"] = prompt
+            return json.dumps({"action": "final", "answer": "Итог."})
+
+    next_step(_FakeProvider(), "Вопрос", "Table: t", scratchpad=[])
+    assert "markdown-таблицу" in captured["prompt"]
+    assert "3 и более" in captured["prompt"]
+
+
+# --- markdown-table survival through _strip_decorative_chars (regression) --------
+# _TABLE_FORMAT_INSTRUCTION asks the model to answer multi-row comparisons as
+# a markdown table; the decorative-char stripper must not mangle that table
+# while still removing bullets/bold/emoji from ordinary prose.
+def test_strip_decorative_chars_leaves_markdown_table_intact():
+    table = (
+        "| Год | OPEX | CAPEX | Δ % |\n"
+        "|---|---|---|---|\n"
+        "| 2026 | 2 792 757 | 3 011 514 | +23.0% |\n"
+        "| 2027 | 4 732 753 | 7 176 236 | +69.5% |"
+    )
+    assert _strip_decorative_chars(table) == table
 
 
 def test_self_check_answer_parses_complete_and_missing():
