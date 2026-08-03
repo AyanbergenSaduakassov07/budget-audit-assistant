@@ -30,6 +30,28 @@ def format_money(v, unit_label=""):
     return f"{v:,.0f} {unit_label}".replace(",", " ").strip()
 
 
+def _as_markdown_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Render a multi-row answer as a markdown table.
+
+    Every deterministic answer below used to be "\\n".join(lines) with one
+    logical row per line. st.write() renders those through standard markdown,
+    which collapses a single "\\n" inside a paragraph -- so the whole answer
+    came out as one run-on wall of text in the chat (confirmed live on
+    "сравни бюджет за все года" and "какая ветка тратит больше"). A real
+    table survives that, and the caller keeps any explanatory sentence in a
+    separate block AFTER the table, never glued to it.
+    """
+    def cell(v):
+        return str(v).replace("|", "\\|").replace("\n", " ")
+
+    out = [
+        "| " + " | ".join(cell(h) for h in headers) + " |",
+        "|" + "---|" * len(headers),
+    ]
+    out += ["| " + " | ".join(cell(c) for c in row) + " |" for row in rows]
+    return "\n".join(out)
+
+
 def sheet_summary_text(sheet_name, meta, df, stats):
     """Russian-language paragraph describing one parsed sheet."""
     if df is None or df.empty:
@@ -131,11 +153,12 @@ def year_trend_text(combined_df):
     suspects = yt[yt["unit_mismatch_suspected"]]
     if suspects.empty:
         return "Тренд по годам выглядит согласованным по порядку величины."
-    lines = [f"{r.Год} ({r.Тип}): {r.Сумма:,.0f}".replace(",", " ") for r in suspects.itertuples()]
+    rows = [[r.Год, r.Тип, f"{r.Сумма:,.0f}".replace(",", " ")] for r in suspects.itertuples()]
     return (
-        "Внимание: следующие значения отличаются от остальных лет более чем в 20 раз -- "
+        _as_markdown_table(["Год", "Тип", "Сумма"], rows)
+        + "\n\nВнимание: значения выше отличаются от остальных лет более чем в 20 раз -- "
         "это выглядит как ошибка единиц измерения в исходном файле (например, факт внесён "
-        "в тенге, а план -- в тыс. тенге), а не как реальный скачок бюджета:\n" + "\n".join(lines)
+        "в тенге, а план -- в тыс. тенге), а не как реальный скачок бюджета."
     )
 
 
@@ -186,6 +209,15 @@ def _yoy_delta_str(current, previous):
     return f" (Δ {pct:+.1f}%)"
 
 
+def _yoy_delta_cell(current, previous):
+    """Bare '+N.N%' for a table cell. _yoy_delta_str()'s parenthesized
+    ' (Δ +N.N%)' form is kept as is for inline prose elsewhere -- pasting it
+    into a cell would repeat the Δ that already sits in the column header."""
+    if previous is None or not previous:
+        return "—"
+    return f"{(current - previous) / previous * 100:+.1f}%"
+
+
 def _multi_year_capex_opex_answer(combined_df, unit, multi_year):
     """Per-year OPEX/CAPEX/ratio/Δ% breakdown -- one line per year instead of
     a single year_col's totals. multi_year is either an explicit (start, end)
@@ -199,7 +231,7 @@ def _multi_year_capex_opex_answer(combined_df, unit, multi_year):
     if not years:
         return "Нет годовых данных для запрошенного диапазона лет."
 
-    lines = ["Разбивка OPEX/CAPEX по годам:"]
+    rows = []
     prev_opex = prev_capex = None
     for year in years:
         col = _resolve_year_col(combined_df, year)
@@ -209,16 +241,20 @@ def _multi_year_capex_opex_answer(combined_df, unit, multi_year):
         capex = pd.to_numeric(combined_df[combined_df["cost_type"] == "CAPEX"][col], errors="coerce").sum()
         label = _YEAR_VALUE_LABELS[col.split("_", 1)[0]]
         ratio = f"{opex / capex:.1f}:1" if capex else "н/д"
-        lines.append(
-            f"{year} ({label}): OPEX = {format_money(opex, unit)}{_yoy_delta_str(opex, prev_opex)}, "
-            f"CAPEX = {format_money(capex, unit)}{_yoy_delta_str(capex, prev_capex)}, "
-            f"OPEX/CAPEX ~ {ratio}"
-        )
+        rows.append([
+            f"{year} ({label})",
+            format_money(opex, unit),
+            _yoy_delta_cell(opex, prev_opex),
+            format_money(capex, unit),
+            _yoy_delta_cell(capex, prev_capex),
+            ratio,
+        ])
         prev_opex, prev_capex = opex, capex
 
-    if len(lines) == 1:
+    if not rows:
         return "Нет данных для расчёта разбивки по годам."
-    return "\n".join(lines)
+    headers = ["Год", "OPEX", "Δ OPEX %", "CAPEX", "Δ CAPEX %", "OPEX/CAPEX"]
+    return _as_markdown_table(headers, rows) + "\n\nРазбивка OPEX/CAPEX по годам."
 
 
 # --- shared keyword-matching helpers used by both answer_query() and chat_answer() --
@@ -371,9 +407,16 @@ def answer_query(question, df, stats, meta):
         if plan_col not in df.columns:
             return "Нет данных плана для ранжирования."
         n = _requested_top_n(q)
-        top = df.nlargest(n, plan_col)[["item_name", plan_col]]
-        lines = [f"{r.item_name}: {format_money(getattr(r, plan_col), unit)}" for r in top.itertuples()]
-        return f"Топ-{n} самых крупных статей:\n" + "\n".join(lines)
+        # cost_type/branch only exist once sheets are aggregated into the
+        # workbook-wide frame -- include them when the caller passed one.
+        extra = [c for c in ("cost_type", "branch") if c in df.columns]
+        top = df.nlargest(n, plan_col)[["item_name", *extra, plan_col]]
+        headers = ["Статья"] + [{"cost_type": "Тип", "branch": "Ветка"}[c] for c in extra] + ["Сумма"]
+        rows = [
+            [r.item_name, *(getattr(r, c) for c in extra), format_money(getattr(r, plan_col), unit)]
+            for r in top.itertuples()
+        ]
+        return _as_markdown_table(headers, rows) + f"\n\nТоп-{n} самых крупных статей."
 
     if any(w in q for w in ["сколько статей", "количество статей", "число статей"]):
         return f"Заполненных статей расхода: {len(df)}."
@@ -481,8 +524,8 @@ def chat_answer(question, combined_df, meta):
         col = year_col or plan_col
         g = combined_df.groupby("branch")[col].apply(lambda s: pd.to_numeric(s, errors="coerce").sum())
         g = g.sort_values(ascending=False)
-        lines = [f"{b}: {format_money(v, unit)}" for b, v in g.items()]
-        return "По подразделениям:\n" + "\n".join(lines)
+        rows = [[b, format_money(v, unit)] for b, v in g.items()]
+        return _as_markdown_table(["Подразделение", "Сумма"], rows) + "\n\nИтоги по подразделениям."
 
     if _mentions_missing_justification(q):
         if "missing_justification_flag" not in combined_df.columns:
@@ -491,15 +534,24 @@ def chat_answer(question, combined_df, meta):
         if missing.empty:
             return "Все статьи имеют заполненное обоснование."
         by_branch = missing.groupby("branch").size()
-        lines = [f"{b}: {n} статей" for b, n in by_branch.items()]
-        return f"Всего без обоснования: {len(missing)} статей.\n" + "\n".join(lines)
+        rows = [[b, n] for b, n in by_branch.items()]
+        return (
+            _as_markdown_table(["Подразделение", "Статей без обоснования"], rows)
+            + f"\n\nВсего без обоснования: {len(missing)} статей."
+        )
 
     if any(w in q for w in ["самые дорог", "самые крупн", "топ", "риск"]):
         n = _requested_top_n(q)
         col = year_col or plan_col
         top = combined_df.nlargest(n, col)[["item_name", "cost_type", "branch", col]]
-        lines = [f"{r.item_name} ({r.cost_type}, {r.branch}): {format_money(getattr(r, col), unit)}" for r in top.itertuples()]
-        return f"Топ-{n} самых крупных статей по всему файлу:\n" + "\n".join(lines)
+        rows = [
+            [r.item_name, r.cost_type, r.branch, format_money(getattr(r, col), unit)]
+            for r in top.itertuples()
+        ]
+        return (
+            _as_markdown_table(["Статья", "Тип", "Ветка", "Сумма"], rows)
+            + f"\n\nТоп-{n} самых крупных статей по всему файлу."
+        )
 
     # keyword search across item_name / category / subcategory / counterparty
     # -- tried BEFORE the plain year-total branch below (Bug B): a question
@@ -557,7 +609,10 @@ def chat_answer(question, combined_df, meta):
         yt = year_trend(combined_df)
         if yt.empty:
             return "В этом файле нет годовых колонок (план/факт/прогноз) для сравнения по годам."
-        lines = [f"{r.Год} — {r.Тип}: {format_money(r.Сумма, unit)}" for r in yt.itertuples()]
-        return "Годы, представленные в файле:\n" + "\n".join(lines)
+        rows = [[r.Год, r.Тип, format_money(r.Сумма, unit)] for r in yt.itertuples()]
+        return (
+            _as_markdown_table(["Год", "Тип", "Сумма"], rows)
+            + "\n\nГоды, представленные в файле."
+        )
 
     return None

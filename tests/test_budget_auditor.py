@@ -7,6 +7,7 @@ the real subsidiary forms (see parser.py module docstring):
   - newer-template style: reordered headers ("ФАКТ за 2025 год"), dual plan-year columns
 """
 
+import re
 from pathlib import Path
 
 import openpyxl
@@ -30,6 +31,32 @@ from core.budget_auditor.analysis import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+# --- markdown-table assertions --------------------------------------------------
+# Multi-row deterministic answers are markdown tables, not "\n"-joined lines:
+# st.write() collapses single newlines inside a paragraph, so the old format
+# rendered as one run-on wall of text in the chat.
+def _table_rows(reply):
+    """Data rows (header and |---| separator excluded) as lists of cells.
+    Splits on unescaped pipes only, then unescapes, so a cell containing a
+    literal "|" reads back as one cell."""
+    rows = []
+    for i, line in enumerate(reply.splitlines()):
+        if not line.startswith("|") or i < 2:
+            continue
+        cells = re.split(r"(?<!\\)\|", line)[1:-1]
+        rows.append([c.strip().replace("\\|", "|") for c in cells])
+    return rows
+
+
+def _assert_is_markdown_table(reply, n_cols=None):
+    assert reply.startswith("|"), reply
+    lines = reply.splitlines()
+    assert lines[1].startswith("|---"), reply
+    if n_cols is not None:
+        assert lines[1] == "|" + "---|" * n_cols, reply
+    assert _table_rows(reply), "table has no data rows"
 
 
 # --- workbook builders ---------------------------------------------------------
@@ -270,8 +297,10 @@ def test_chat_answer_top_n_parsed_from_question(full_form):
     meta, _, _, combined = full_form
     reply = chat_answer("топ-3 самых крупных", combined, meta)
     assert reply is not None
-    assert reply.startswith("Топ-3 самых крупных статей по всему файлу:")
-    assert len(reply.splitlines()) == 4  # header + exactly 3 rows
+    assert reply.startswith("| Статья | Тип | Ветка | Сумма |")
+    assert "|---" in reply
+    assert len(_table_rows(reply)) == 3  # exactly 3 data rows, header excluded
+    assert "Топ-3 самых крупных статей по всему файлу." in reply
     assert "СХД" not in reply  # the 4th/lowest-value row, correctly excluded
 
 
@@ -291,8 +320,10 @@ def test_answer_query_top_n_parses_requested_count(full_form):
     df, stats = flagged["ГО CAPEX"]["df"], flagged["ГО CAPEX"]["stats"]
     reply = answer_query("топ-1 самых крупных", df, stats, meta)
     assert reply is not None
-    assert reply.startswith("Топ-1 самых крупных статей:")
-    assert len(reply.splitlines()) == 2  # header + exactly 1 row
+    assert reply.startswith("| Статья | Сумма |")  # single sheet: no cost_type/branch cols
+    assert "|---" in reply
+    assert len(_table_rows(reply)) == 1  # exactly 1 data row
+    assert "Топ-1 самых крупных статей." in reply
 
 
 def test_chat_answer_compound_bailout_prevents_partial_branch_comparison():
@@ -390,18 +421,19 @@ def test_chat_answer_multi_year_capex_opex_breakdown(multi_year_form):
     meta, _, _, combined = multi_year_form
     reply = chat_answer("раздели планы на opex/capex по всем годам", combined, meta)
     assert reply is not None
-    lines = reply.splitlines()
-    assert lines[0] == "Разбивка OPEX/CAPEX по годам:"
-    assert len(lines) == 4  # header + 2025/2026/2027, not a single-year answer
+    assert reply.startswith("| Год | OPEX | Δ OPEX % | CAPEX | Δ CAPEX % | OPEX/CAPEX |")
+    assert "|---" in reply
+    rows = _table_rows(reply)
+    assert len(rows) == 3  # 2025/2026/2027, not a single-year answer
 
-    assert "2025 (Факт): OPEX = 8 000" in reply
-    assert "CAPEX = 4 000" in reply
-    assert "2026 (План): OPEX = 9 000" in reply
-    assert "2027 (План): OPEX = 10 000" in reply
-    assert "OPEX/CAPEX ~ 2.0:1" in reply
+    assert rows[0][:2] == ["2025 (Факт)", "8 000 тыс."]
+    assert rows[0][3] == "4 000 тыс."
+    assert rows[1][1] == "9 000 тыс."
+    assert rows[2][1] == "10 000 тыс."
+    assert [r[-1] for r in rows] == ["2.0:1"] * 3
     # First year has no prior year to compare against; later years do.
-    assert "Δ" not in lines[1]
-    assert "Δ +12.5%" in lines[2]  # 8000 -> 9000 and 4000 -> 4500 both +12.5%
+    assert rows[0][2] == rows[0][4] == "—"
+    assert rows[1][2] == rows[1][4] == "+12.5%"  # 8000 -> 9000 and 4000 -> 4500
 
 
 def test_chat_answer_sravni_multi_year_without_explicit_capex_opex_keyword(multi_year_form):
@@ -411,7 +443,8 @@ def test_chat_answer_sravni_multi_year_without_explicit_capex_opex_keyword(multi
     meta, _, _, combined = multi_year_form
     reply = chat_answer("сравни планы за все года", combined, meta)
     assert reply is not None
-    assert reply.startswith("Разбивка OPEX/CAPEX по годам:")
+    assert reply.startswith("| Год |")
+    assert "Разбивка OPEX/CAPEX по годам." in reply
     assert "2025" in reply and "2026" in reply and "2027" in reply
 
 
@@ -674,6 +707,94 @@ def test_year_trend_flags_unit_mismatch():
     assert yt.loc[yt["Год"] == 2025, "unit_mismatch_suspected"].all()
     assert not yt.loc[yt["Год"] != 2025, "unit_mismatch_suspected"].any()
     assert "единиц измерения" in year_trend_text(fake)
+
+
+# --- markdown-table rendering of multi-row answers -------------------------------
+# Live bug: every one of these built its answer as "\n".join(lines) with a label
+# line on top. st.write() renders that through standard markdown, which collapses
+# a single "\n" inside a paragraph -- so "сравни бюджет за все года" crammed all
+# 7 years into one run-on paragraph and "какая ветка тратит больше" did the same
+# for the branch totals. Each now returns a real markdown table (explanatory
+# sentence moved to its own block AFTER the table, never glued to the last row).
+def test_multi_year_breakdown_renders_as_table(multi_year_form):
+    meta, _, _, combined = multi_year_form
+    reply = chat_answer("сравни бюджет за все года", combined, meta)
+    _assert_is_markdown_table(reply, n_cols=6)
+    assert reply.splitlines()[0] == "| Год | OPEX | Δ OPEX % | CAPEX | Δ CAPEX % | OPEX/CAPEX |"
+    assert reply.endswith("Разбивка OPEX/CAPEX по годам.")
+
+
+def test_branch_comparison_renders_as_table(full_form):
+    meta, _, _, combined = full_form
+    reply = chat_answer("какая ветка тратит больше", combined, meta)
+    _assert_is_markdown_table(reply, n_cols=2)
+    assert reply.splitlines()[0] == "| Подразделение | Сумма |"
+    assert _table_rows(reply)[0][0] == "ГО"  # highest spender still ranked first
+
+
+def test_missing_justification_by_branch_renders_as_table(full_form):
+    meta, _, _, combined = full_form
+    reply = chat_answer("какие статьи без обоснования", combined, meta)
+    _assert_is_markdown_table(reply, n_cols=2)
+    assert reply.splitlines()[0] == "| Подразделение | Статей без обоснования |"
+    assert sum(int(r[1]) for r in _table_rows(reply)) == 3
+    assert reply.endswith("Всего без обоснования: 3 статей.")
+
+
+def test_workbook_top_items_render_as_table(full_form):
+    meta, _, _, combined = full_form
+    reply = chat_answer("топ самых дорогих статей", combined, meta)
+    _assert_is_markdown_table(reply, n_cols=4)
+    assert reply.splitlines()[0] == "| Статья | Тип | Ветка | Сумма |"
+    assert _table_rows(reply)[0][0] == "Серверы"
+
+
+def test_sheet_top_items_render_as_table(full_form):
+    meta, _, flagged, _ = full_form
+    df, stats = flagged["ГО CAPEX"]["df"], flagged["ГО CAPEX"]["stats"]
+    reply = answer_query("самые крупные статьи", df, stats, meta)
+    _assert_is_markdown_table(reply, n_cols=2)
+    assert reply.splitlines()[0] == "| Статья | Сумма |"
+
+
+def test_available_years_listing_renders_as_table(tmp_path):
+    meta, _, _, combined = _run_pipeline(_no_target_year_workbook(tmp_path / "subb_tbl.xlsx"))
+    reply = chat_answer("есть ли бюджет за прошлые года", combined, meta)
+    _assert_is_markdown_table(reply, n_cols=3)
+    assert reply.splitlines()[0] == "| Год | Тип | Сумма |"
+    assert reply.endswith("Годы, представленные в файле.")
+
+
+def test_unit_mismatch_warning_renders_as_table():
+    fake = pd.DataFrame({
+        "plan_2026": [100.0],
+        "plan_2027": [120.0],
+        "fact_2025": [9_000_000.0],  # entered in raw tenge, not тыс.
+    })
+    reply = year_trend_text(fake)
+    _assert_is_markdown_table(reply, n_cols=3)
+    assert reply.splitlines()[0] == "| Год | Тип | Сумма |"
+    assert _table_rows(reply) == [["2025", "факт", "9 000 000"]]
+    assert "единиц измерения" in reply  # explanation kept, just after the table
+
+
+def test_table_cells_escape_pipes():
+    """A pipe inside an item name would otherwise split the row into extra
+    columns and break the whole table's alignment."""
+    combined = pd.DataFrame({
+        "branch": ["ГО|АФ"],
+        "cost_type": ["OPEX"],
+        "item_name": ["Связь"],
+        "category": ["Связь"],
+        "subcategory": [None],
+        "counterparty": [None],
+        "plan_year": [2026],
+        "plan_2026": [1000.0],
+    })
+    reply = chat_answer("какая ветка тратит больше", combined, {"unit": 1000})
+    _assert_is_markdown_table(reply, n_cols=2)
+    assert r"ГО\|АФ" in reply           # escaped in the raw markdown
+    assert _table_rows(reply)[0][0] == "ГО|АФ"  # ...and still one cell when parsed
 
 
 # --- quarterly reconciliation flag ----------------------------------------------
