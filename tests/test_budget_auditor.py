@@ -28,6 +28,9 @@ from core.budget_auditor.analysis import (
     year_trend_text,
     chat_answer,
     answer_query,
+    format_money,
+    _search_tokens,
+    _keyword_search_mask,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -795,6 +798,139 @@ def test_table_cells_escape_pipes():
     _assert_is_markdown_table(reply, n_cols=2)
     assert r"ГО\|АФ" in reply           # escaped in the raw markdown
     assert _table_rows(reply)[0][0] == "ГО|АФ"  # ...and still one cell when parsed
+
+
+# --- keyword search: AND across tokens, short tokens kept ------------------------
+# Live bug: "Сколько потратили на ACM Digital?" returned an inflated total against a
+# manually-verified true total of the correct total The len(t) > 3 cutoff dropped
+# "acm" and kept only "digital", and tokens were OR'd across all four searched
+# columns -- so any row merely mentioning "digital" anywhere counted as ACM
+# Digital spend. No real ACM Digital workbook exists in this repo's fixtures
+# (they're all built programmatically), so the shape is reconstructed here:
+# two genuine rows plus three decoys that each satisfy the old matcher.
+_ACM_DIGITAL_TRUE_TOTAL = 761_000.0
+
+
+def _acm_digital_df():
+    return pd.DataFrame({
+        "branch": ["ГО"] * 5,
+        "cost_type": ["OPEX"] * 5,
+        "item_name": [
+            "Сопровождение ИС",
+            "Лицензии",
+            "Digital signage для холла",   # decoy: "digital" in item_name
+            "Аутсорсинг",                  # decoy: "acm" in counterparty only
+            "Digital-маркетинг",           # decoy: "digital" in item_name
+        ],
+        "category": ["Услуги"] * 5,
+        "subcategory": [None] * 5,
+        "counterparty": [
+            "ACM Digital",
+            "ACM Digital",
+            "ТОО Ромашка",
+            "ACM Systems",
+            "АО Медиа",
+        ],
+        "plan_year": [2026] * 5,
+        "plan_2026": [500_000.0, 261_000.0, 3_000.0, 900.0, 763.5],
+    })
+
+
+def test_multiword_name_requires_all_tokens_in_one_column():
+    """The over-count case. Only the two real ACM Digital rows may be summed;
+    every decoy satisfies "digital" OR "acm" but not both in one column."""
+    combined = _acm_digital_df()
+    reply = chat_answer("Сколько потратили на ACM Digital?", combined, {"unit": 1000})
+    assert reply is not None
+    assert "Найдено 2 статей" in reply
+    assert "Сопровождение ИС" in reply and "Лицензии" in reply
+    for decoy in ("Digital signage", "Аутсорсинг", "Digital-маркетинг"):
+        assert decoy not in reply
+    # 500 000 + 261 493.5, formatted with a space thousands separator
+    assert format_money(_ACM_DIGITAL_TRUE_TOTAL, 1000) in reply
+
+
+def test_short_acronym_token_is_not_dropped():
+    """"acm" is 3 chars -- the old len(t) > 3 rule discarded it, leaving the
+    search to mean "anything containing 'digital'"."""
+    assert _search_tokens("сколько потратили на acm digital") == ["acm", "digital"]
+    assert "it" in _search_tokens("расходы на IT")
+    assert "sap" in _search_tokens("сколько стоит SAP")
+
+
+def test_search_tokens_drop_question_scaffolding_and_years():
+    """AND-ing tokens only works if question words are gone: one stray
+    "сколько" required in every match would sink the whole query."""
+    tokens = _search_tokens("сколько всего потратили на серверы в 2026 году")
+    assert tokens == ["серверы"]
+    assert _search_tokens("сколько всего потратили в 2026 году") == []
+
+
+def test_and_matching_does_not_span_two_columns():
+    """A row whose category supplies one token and counterparty the other must
+    NOT match -- that cross-column OR is what pulled in unrelated rows."""
+    combined = pd.DataFrame({
+        "branch": ["ГО"],
+        "cost_type": ["OPEX"],
+        "item_name": ["Прочее"],
+        "category": ["ACM услуги"],      # supplies "acm"
+        "subcategory": [None],
+        "counterparty": ["ТОО Digital"],  # supplies "digital"
+        "plan_year": [2026],
+        "plan_2026": [5_000.0],
+    })
+    mask = _keyword_search_mask(combined, ["acm", "digital"])
+    assert not mask.any()
+
+
+def test_inflected_russian_token_is_dropped_not_and_ed(full_form):
+    """Russian morphology: "сотовую" is not a substring of the item «Сотовая
+    связь», so AND-ing the raw word forms would collapse the query to nothing.
+    A token matching no row anywhere isn't a filter -- it's dropped, and the
+    tokens that DO hit real rows are AND-ed."""
+    meta, _, _, combined = full_form
+    assert _search_tokens("сколько потратили на сотовую связь") == ["сотовую", "связь"]
+    assert not _keyword_search_mask(combined, ["сотовую"]).any()  # matches nothing
+
+    reply = chat_answer("сколько потратили на сотовую связь", combined, meta)
+    assert reply is not None
+    assert "Сотовая связь" in reply
+
+
+def test_useful_token_and_ing_keeps_the_decoys_out():
+    combined = _acm_digital_df()
+    mask = _keyword_search_mask(combined, ["acm", "digital"])
+    assert mask.sum() == 2
+    assert combined[mask]["plan_2026"].sum() == _ACM_DIGITAL_TRUE_TOTAL
+
+
+def test_all_tokens_unmatched_yields_no_rows():
+    """Nothing in the data uses any of these words -- the branch must find
+    nothing rather than widen back to an any-token match."""
+    combined = _acm_digital_df()
+    assert not _keyword_search_mask(combined, ["вертолёт", "буровая"]).any()
+
+
+def test_single_token_search_unchanged(full_form):
+    """One token means AND and OR are the same thing -- non-regression."""
+    meta, _, _, combined = full_form
+    reply = chat_answer("Телеком Плюс", combined, meta)
+    assert reply is not None
+    assert "7 200" in reply
+
+
+def test_answer_query_single_sheet_uses_the_same_matcher(full_form):
+    """The single-sheet function had the identical bug and shares the fix."""
+    meta, _, flagged, _ = full_form
+    df, stats = flagged["OPEX"]["df"], flagged["OPEX"]["stats"]
+    combined_like = df.assign(counterparty=["ACM Digital", "ТОО Ромашка", "ACM Systems"][: len(df)])
+    combined_like = combined_like.assign(
+        item_name=["Сопровождение", "Digital signage", "Аутсорсинг"][: len(df)]
+    )
+    reply = answer_query("сколько потратили на ACM Digital", combined_like, stats, meta)
+    assert reply is not None
+    assert "Найдено 1 совпадающих статей" in reply
+    assert "Digital signage" not in reply
 
 
 # --- company / file identity -----------------------------------------------------

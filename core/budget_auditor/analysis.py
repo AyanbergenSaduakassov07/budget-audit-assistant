@@ -275,6 +275,102 @@ def _mentions_missing_justification(q):
     return "обоснован" in q and any(neg in q for neg in _JUSTIFICATION_NEGATIONS)
 
 
+# --- keyword search ("сколько потратили на X") ----------------------------------
+# Live bug: "Сколько потратили на ACM Digital?" returned an inflated total against a
+# manually-verified true total of the correct total Two compounding causes:
+#
+#   1. the len(t) > 3 cutoff dropped "acm" (3 chars) and kept only "digital",
+#      so the search silently became "anything containing 'digital'";
+#   2. tokens were OR'd across all four searched columns, so ONE word of a
+#      multi-word proper name hitting ANY column was enough to pull a row in.
+#
+# Together those counted rows that merely mention "digital" somewhere as
+# ACM Digital spend. Now: tokens are kept down to 2 chars (3-letter acronyms
+# -- ACM, SAP, IT codes -- are everywhere in this domain), question
+# scaffolding is dropped by an explicit stopword list instead of by length,
+# and a row matches only when ONE column contains ALL of the tokens.
+_SEARCH_COLUMNS = ("item_name", "category", "subcategory", "counterparty")
+
+# Question scaffolding. The old len(t) > 3 rule was doing this job by accident
+# -- badly, since it also dropped real acronyms. AND-ing tokens makes an
+# explicit list necessary: "сколько" left in would match nothing and sink the
+# whole query.
+_SEARCH_STOPWORDS = frozenset({
+    # interrogatives / verbs of the "how much did we spend on X" frame
+    "сколько", "потратили", "потратил", "потрачено", "тратим", "тратит",
+    "тратят", "какой", "какая", "какие", "каком", "какого", "что", "чего",
+    "где", "когда", "покажи", "выведи", "дай", "есть", "было", "были",
+    "будет", "нужно",
+    # quantity / money nouns
+    "всего", "итого", "итог", "сумма", "суммарно", "общая", "общий",
+    "расход", "расходы", "расходов", "затраты", "затрат", "бюджет",
+    "бюджета", "тенге", "тыс", "млн",
+    "статья", "статьи", "статей", "статью", "статьям",
+    # time
+    "год", "года", "году", "годов", "годам", "лет",
+    # pronouns / prepositions / particles (now reachable at the 2-char floor)
+    "это", "этой", "этом", "эти", "наш", "наша", "нашей", "для", "или",
+    "на", "за", "по", "до", "от", "из", "под", "при", "про", "без", "над",
+    "об", "обо", "то", "же", "ли", "не", "ни", "бы", "мы", "вы", "он", "их",
+    "его", "ее", "как", "так", "там", "вот", "уже", "мне", "нам",
+})
+
+
+def _search_tokens(q):
+    """Searchable terms from a question: 2+ chars, no question scaffolding, no
+    bare years (the year is resolved separately into year_col), deduplicated
+    with order preserved."""
+    tokens = []
+    for t in re.split(r"[^а-яa-zё0-9]+", q.lower()):
+        if len(t) < 2 or t in _SEARCH_STOPWORDS or re.fullmatch(r"20\d{2}", t):
+            continue
+        if t not in tokens:
+            tokens.append(t)
+    return tokens
+
+
+def _keyword_search_mask(df, tokens):
+    """Rows where a SINGLE searched column contains ALL of the useful tokens.
+
+    "All tokens" is the fix for the over-count; "single column" is what makes
+    it meaningful -- letting "acm" match the category while "digital" matches
+    the counterparty re-admits exactly the rows this is meant to exclude.
+
+    A strict AND over the raw word forms would be too brittle for Russian:
+    "сколько потратили на сотовую связь" asks about the item «Сотовая связь»,
+    and "сотовую" is not a substring of "сотовая", so the whole query would
+    collapse to nothing. The distinction that resolves it: a token matching
+    NO row anywhere isn't a filter at all -- it's a word this file's data
+    doesn't use (an inflected form, or question scaffolding the stopword list
+    missed). Those are dropped, and whatever is left is AND-ed. "сотовую"
+    drops out and «связь» answers the question; "acm" and "digital" both hit
+    real rows, so both are required, and the decoys stay out.
+    """
+    empty = pd.Series(False, index=df.index)
+    present = [c for c in _SEARCH_COLUMNS if c in df.columns]
+    if not tokens or not present:
+        return empty
+
+    lowered = {c: df[c].astype(str).str.lower() for c in present}
+    # regex=False: tokens are alphanumeric by construction, but this keeps
+    # them literal if the split pattern is ever loosened.
+    useful = []
+    for t in tokens:
+        hits = {c: lowered[c].str.contains(t, na=False, regex=False) for c in present}
+        if any(h.any() for h in hits.values()):
+            useful.append(hits)
+    if not useful:
+        return empty
+
+    mask = empty.copy()
+    for col in present:
+        col_mask = pd.Series(True, index=df.index)
+        for hits in useful:
+            col_mask &= hits[col]
+        mask |= col_mask
+    return mask
+
+
 # Bug E: the "топ"/"самых"/"риск" ranking branches hardcoded nlargest(5).
 # Parse an optional requested count adjacent to "топ"/"самых" ("топ-3",
 # "топ 10", "3 самых"), capped at _MAX_TOP_N regardless of what's requested.
@@ -553,14 +649,9 @@ def answer_query(question, df, stats, meta):
     # naming both a year AND some other filter (counterparty/category/item
     # keyword) must be answered by that filter, not silently fall back to the
     # whole year's total just because a year was also mentioned.
-    tokens = [t for t in re.split(r"[^а-яa-zё0-9]+", q) if len(t) > 3]
+    tokens = _search_tokens(q)
     if tokens:
-        mask = pd.Series(False, index=df.index)
-        for col in ["item_name", "category", "subcategory", "counterparty"]:
-            if col in df.columns:
-                for t in tokens:
-                    mask |= df[col].astype(str).str.lower().str.contains(t, na=False)
-        matched = df[mask]
+        matched = df[_keyword_search_mask(df, tokens)]
         if not matched.empty:
             col = year_col or f"plan_{stats['plan_year']}"
             total = pd.to_numeric(matched[col], errors="coerce").sum() if col in matched.columns else None
@@ -697,14 +788,9 @@ def chat_answer(question, combined_df, meta):
     # naming both a year AND some other filter (counterparty/category/item
     # keyword) must be answered by that filter, not silently fall back to the
     # whole-file year total just because a year was also mentioned.
-    tokens = [t for t in re.split(r"[^а-яa-zё0-9]+", q) if len(t) > 3]
+    tokens = _search_tokens(q)
     if tokens:
-        mask = pd.Series(False, index=combined_df.index)
-        for col in ["item_name", "category", "subcategory", "counterparty"]:
-            if col in combined_df.columns:
-                for t in tokens:
-                    mask |= combined_df[col].astype(str).str.lower().str.contains(t, na=False)
-        matched = combined_df[mask]
+        matched = combined_df[_keyword_search_mask(combined_df, tokens)]
         if not matched.empty:
             col = year_col or plan_col
             total = pd.to_numeric(matched[col], errors="coerce").sum() if col in matched.columns else None
