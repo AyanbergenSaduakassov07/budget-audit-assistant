@@ -8,10 +8,6 @@ venv/
 dist/
 build/
 
-# Node — regenerate via `npm install` from package.json/package-lock.json,
-# never commit the tree itself (was committed early on; untracked later).
-node_modules/
-
 # Data
 *.db
 *.db-journal
@@ -33,3 +29,6 @@ Thumbs.db
 *.swp
 .env
 .env.*
+
+# Office lock files (created while a .docx/.xlsx is open locally)
+~$*
