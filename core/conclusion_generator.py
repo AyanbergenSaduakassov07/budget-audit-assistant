@@ -42,6 +42,14 @@ import pandas as pd
 
 _RENDER_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "render_conclusion.js"
 
+# Without this, a hung/slow Node process blocks subprocess.run() forever --
+# it never raises, so the try/except below (and app.py's own broad
+# except-Exception around this whole call) never gets a chance to catch
+# anything and fall back to "no .docx button" as designed. A timeout turns
+# that silent hang into a real TimeoutExpired exception, which the existing
+# fallback already handles correctly.
+_NODE_RENDER_TIMEOUT_S = 30
+
 _ATK_DECISION = "АТК"
 _CLARIFICATION_DECISION = "уточнение"
 _APPROVED_DECISION = "согласовано"
@@ -316,6 +324,7 @@ def generate_conclusion(audit_result: dict, output_path: str | None = None) -> s
             ["node", str(_RENDER_SCRIPT), payload_path, output_path],
             capture_output=True,
             text=True,
+            timeout=_NODE_RENDER_TIMEOUT_S,
         )
         if result.returncode != 0:
             raise RuntimeError(f"docx generation failed: {result.stderr.strip()}")
