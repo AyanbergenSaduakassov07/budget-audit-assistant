@@ -184,6 +184,27 @@ def inject_css() -> None:
         }}
         [data-testid="stDataFrame"] {{ background: {BUBBLE}; border-radius: 6px; }}
 
+        /* Streamlit fades already-rendered content while a rerun is in
+           flight (its "stale element" indicator) -- reads as the whole
+           page going dim/grey mid-demo, which looks broken to someone who
+           doesn't know Streamlit's internals. Force full opacity throughout
+           a run. Not a single stable documented selector for this across
+           versions, so several overlapping ones are forced together;
+           harmless if some don't match this Streamlit build. Cache-spinner
+           text (e.g. "Формирую заключение…") is untouched -- that's a
+           separate, wanted signal that something is happening. */
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMainBlockContainer"],
+        [data-testid="stBottomBlockContainer"],
+        [data-testid="stVerticalBlock"],
+        [data-testid="stVerticalBlockBorderWrapper"],
+        .main .block-container,
+        .element-container,
+        .stChatMessage {{
+            opacity: 1 !important;
+            transition: none !important;
+        }}
+
         /* Empty state: vertically centered short prompt */
         .empty-state {{
             min-height: 55vh; display: flex; flex-direction: column;
