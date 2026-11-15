@@ -60,7 +60,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Real budget forms run a few hundred rows per sheet; this is generous headroom,
-# not a tight fit. A sheet past this is almost certainly not a ИТ-бюджет form (e.g.
+# not a tight fit. A sheet past this is almost certainly not an IT-budget form (e.g.
 # a full transactional export) and parsing it fully would be slow for no
 # useful result -- reject before the per-sheet parse loop runs at all, not
 # after. Raise this constant if a legitimate large subsidiary file needs it.

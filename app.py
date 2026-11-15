@@ -1,7 +1,7 @@
 """IT Budget Auditor — single-page, chat-first Streamlit app.
 
 The conversation IS the app (ChatGPT-style): one st.chat_input with
-accept_file=True is the only input on the page. Dropping a ИТ-бюджет .xlsx into it
+accept_file=True is the only input on the page. Dropping an IT-budget .xlsx into it
 runs the existing parse -> flag_rows -> aggregate_workbook pipeline and pushes
 the full analysis as ONE assistant message (summary text, CAPEX/OPEX table +
 chart, year trend, three collapsed flag expanders). Every follow-up question

@@ -257,7 +257,7 @@ def generate(seed: int = 42):
 
 
 def generate_group(seed: int = 42):
-    """Generate group-wide procurement data for all ACM subsidiaries.
+    """Generate group-wide procurement data for all subsidiaries.
 
     Returns (df, ground_truth):
       - df: a single flat DataFrame with GROUP_COLUMNS, covering every

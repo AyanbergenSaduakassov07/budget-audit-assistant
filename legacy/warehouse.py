@@ -145,7 +145,7 @@ item for one subsidiary in one year. All monetary values are in national
 tenge (KZT).
 
 Columns:
-  - subsidiary  TEXT    Name of the ACM subsidiary that made the purchase.
+  - subsidiary  TEXT    Name of the subsidiary that made the purchase.
   - year        INTEGER Procurement year (four-digit).
   - item_name   TEXT    Name of the purchased item (lowercase, e.g. 'microsoft 365 e3').
   - supplier    TEXT    Name of the supplier/vendor (lowercase).

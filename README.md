@@ -1,10 +1,10 @@
-# IT Budget Auditor
+# Budget Audit Assistant
 
-Chat-first Streamlit prototype that audits corporate IT-budget Excel forms: upload a workbook, get rule-based anomaly flags, ask follow-up questions in Russian, and export a draft review conclusion (.docx and .pptx).
+Prototype for auditing corporate IT-budget Excel forms, built as a chat-first Streamlit app: upload a workbook, get rule-based anomaly flags, ask follow-up questions in Russian, and export a draft review conclusion (.docx and .pptx).
 
 ## Why I built it
 
-Reviewing subsidiaries' IT-budget forms was manual: open each Excel file, check quarter totals, year-over-year growth, supplier concentration and missing fields, then write the findings up by hand. This tool automates the mechanical part and leaves the judgement to the reviewer. It is a prototype; it was developed against sample forms and the repository contains no company data (tests generate their own synthetic workbooks).
+Reviewing subsidiaries' IT-budget forms by hand is slow: open each Excel file, check quarter totals, year-over-year growth, supplier concentration and missing fields, then write the findings up. This tool automates the mechanical part and leaves the judgement to the reviewer. It is a prototype, developed against sample forms; the repository contains no real data (tests generate their own synthetic workbooks).
 
 ## Features
 
