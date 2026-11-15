@@ -2,6 +2,16 @@
 
 Prototype for auditing corporate IT-budget Excel forms, built as a chat-first Streamlit app: upload a workbook, get rule-based anomaly flags, ask follow-up questions in Russian, and export a draft review conclusion (.docx and .pptx).
 
+## Screenshots
+
+Synthetic demo workbook (invented company and suppliers), 1440x900.
+
+![Chat-first audit view: a deterministic answer to "top 5 items of the 2027 plan" over the uploaded form](docs/assets/chat-audit.png)
+
+![Upload result: sheet summary, OPEX/CAPEX table and bar chart](docs/assets/upload-results.png)
+
+![Flagged items: year-over-year jumps expanded with item, supplier and delta](docs/assets/findings.png)
+
 ## Why I built it
 
 Reviewing subsidiaries' IT-budget forms by hand is slow: open each Excel file, check quarter totals, year-over-year growth, supplier concentration and missing fields, then write the findings up. This tool automates the mechanical part and leaves the judgement to the reviewer. It is a prototype, developed against sample forms; the repository contains no real data (tests generate their own synthetic workbooks).
