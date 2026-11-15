@@ -1,7 +1,7 @@
 [project]
 name = "budget-audit-assistant"
 version = "0.1.0"
-description = "Add your description here"
+description = "Chat-first auditor for corporate IT-budget Excel forms (prototype)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

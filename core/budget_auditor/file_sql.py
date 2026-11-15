@@ -21,7 +21,7 @@ answer_over_file() NEVER raises: no key, quota exhaustion, bad SQL, or any other
 failure returns None, so app.py falls back to its existing "Не нашёл…" message —
 an answer slot never shows an error.
 
-Per SPEC_AUDIT.md architecture rule: pure module, no streamlit imports.
+Architecture rule: pure module, no streamlit imports.
 """
 
 from __future__ import annotations

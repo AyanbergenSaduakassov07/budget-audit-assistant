@@ -4,7 +4,7 @@ Loads the flat DataFrame produced by synth.generate_group() into a local SQLite
 database so the query engine can run SQL against it, and exposes a read-only
 query helper plus a schema description that grounds the language model's SQL.
 
-Per SPEC.md architecture rule: this module is pure — no streamlit imports.
+Architecture rule: this module is pure — no streamlit imports.
 Built-in sqlite3 only, no ORM / SQLAlchemy.
 """
 

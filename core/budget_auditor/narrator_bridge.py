@@ -27,7 +27,7 @@ narrative is the first thing a person sees in the chat, so any failure
 (no key, quota, network, malformed model output, unexpected input shape)
 degrades silently to None and the caller falls back to the template summary.
 
-Per SPEC_AUDIT.md architecture rule: pure module, no streamlit imports.
+Architecture rule: pure module, no streamlit imports.
 """
 
 from __future__ import annotations

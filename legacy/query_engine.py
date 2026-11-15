@@ -16,7 +16,7 @@ everything queried so far in this same answer) — used by
 core.budget_auditor.file_sql.answer_over_file() so the model can react to
 what an early query reveals instead of planning every query up front.
 
-Per SPEC.md architecture rule: this module is pure — no streamlit imports.
+Architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations

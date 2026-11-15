@@ -4,7 +4,7 @@ These rules mirror what a expert checks by hand when writing a Заключен�
 on a subsidiary's IT budget submission: quarterly arithmetic, year-over-year
 growth thresholds, supplier concentration, missing fields, and brand-new line
 items. Everything here is a pure function over pandas DataFrames — no LLM
-calls, no I/O, no streamlit imports (per SPEC.md's core/ architecture rule).
+calls, no I/O, no streamlit imports (core/ stays UI-free).
 
 Operates on the canonical DataFrame produced by
 core.corporate_ingest.canonicalize() + compute_deltas() (already wired

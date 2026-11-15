@@ -23,7 +23,7 @@ mapping that gets silently overwritten downstream anyway. Money columns
 follow the exact plan_<year>/fact_<year>/forecast_<year>[_qN] naming
 file_sql._MONEY_RE already matches.
 
-Per SPEC.md architecture rule: this module is pure -- no streamlit imports.
+Architecture rule: this module is pure -- no streamlit imports.
 """
 
 from __future__ import annotations

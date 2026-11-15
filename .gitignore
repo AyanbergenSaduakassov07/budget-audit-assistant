@@ -29,6 +29,10 @@ Thumbs.db
 *.swp
 .env
 .env.*
+!.env.example
 
 # Office lock files (created while a .docx/.xlsx is open locally)
 ~$*
+
+# Node
+node_modules/

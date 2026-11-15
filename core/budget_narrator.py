@@ -11,7 +11,7 @@ would cite "significant growth at Supplier X" without republishing the ledger.
 Uses the same pluggable-provider client/retry plumbing as legacy.query_engine
 (OpenRouter, via OPENROUTER_API_KEY — the only provider this codebase supports).
 
-Per SPEC.md architecture rule: this module is pure — no streamlit imports.
+Architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations

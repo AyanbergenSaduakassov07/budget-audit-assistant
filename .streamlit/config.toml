@@ -1,4 +1,4 @@
-# ACM SPEC design system — navy accent, warm near-white surface.
+# Navy accent, warm near-white surface.
 # primaryColor drives focus rings, slider, spinner: keep it the accent navy,
 # never red (Streamlit default) and never as a background fill.
 [theme]
@@ -7,7 +7,7 @@ backgroundColor = "#FAF9F6"
 secondaryBackgroundColor = "#FFFFFF"
 textColor = "#2C2C2A"
 
-# Real budget forms are small spreadsheets; 25MB is generous headroom while
+# Budget forms are small spreadsheets; 25MB is generous headroom while
 # ruling out multi-hundred-MB uploads.
 # fileWatcherType="none" turns off Streamlit's dev-mode file watcher (and the
 # "Source file changed" banner it triggers) — this is a production deployment,

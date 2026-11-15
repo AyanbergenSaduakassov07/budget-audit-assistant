@@ -16,7 +16,7 @@ correct unit scaling applied and the sheet's entity attached. Mapping those
 columns onto the eventual budget-data schema is a separate, intentionally
 out-of-scope next step — nothing here renames columns to the procurement schema.
 
-Per SPEC.md architecture rule: this module is pure — no streamlit imports.
+Architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations

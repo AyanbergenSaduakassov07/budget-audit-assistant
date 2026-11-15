@@ -1,17 +1,17 @@
 """Canonical schema normalization for procurement DataFrames.
 
 `normalize` is the single entry point: it enforces the canonical row schema from
-SPEC.md, cleaning string fields, coercing numeric types, validating invariants,
+the canonical schema, cleaning string fields, coercing numeric types, validating invariants,
 and dropping anything outside the schema.
 
-Per SPEC.md architecture rule: this module is pure — no streamlit imports.
+Architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations
 
 import pandas as pd
 
-# Canonical schema column order (SPEC.md).
+# Canonical schema column order.
 CANONICAL_COLUMNS = [
     "item_name",
     "supplier",

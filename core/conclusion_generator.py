@@ -26,7 +26,7 @@ rows are included here too, whenever run_full_audit's own priority
 resolution (all_rows["decision"]) confirms they landed on уточнение rather
 than getting absorbed into АТК.
 
-Per SPEC.md architecture rule: this module is pure — no streamlit imports.
+Architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations

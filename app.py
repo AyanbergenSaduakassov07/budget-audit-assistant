@@ -8,7 +8,7 @@ chart, year trend, three collapsed flag expanders). Every follow-up question
 goes through the same box and is answered by core chat_answer() over the whole
 file.
 
-Streamlit imports live only in app.py (SPEC.md architecture rule).
+Streamlit imports live only in app.py (architecture rule).
 All parsing/analysis math lives in core.budget_auditor.{parser,analysis};
 app.py only reshapes, renames, formats, and renders what that layer returns.
 
@@ -51,7 +51,7 @@ from core.conclusion_pptx_generator import generate_pptx_conclusion
 
 logger = logging.getLogger(__name__)
 
-# --- palette (SPEC design system — navy is an accent, never a background fill)
+# --- palette (design system — navy is an accent, never a background fill)
 NAVY = "#1F3A5F"
 SURFACE = "#FAF9F6"
 BUBBLE = "#FFFFFF"

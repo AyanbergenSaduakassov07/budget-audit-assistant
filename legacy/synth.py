@@ -4,7 +4,7 @@ Produces two subsidiary DataFrames (df_a, df_b) plus a ground_truth dict that
 records exactly which items carry each deliberately planted discrepancy, so the
 comparison logic can be tested against known answers.
 
-Per SPEC.md architecture rule: this module is pure — no streamlit imports.
+Architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ _GROUP_ARITH_YEAR = 2023
 _GROUP_ARITH_MULTIPLIER = 1.15
 
 # Shared catalog for subsidiary A. Prices are list prices in KZT within the
-# realistic 2026 ranges from SPEC.md (licenses ~80k–500k, monitors ~150k–300k).
+# realistic 2026 ranges (licenses ~80k–500k, monitors ~150k–300k).
 # (item_name, supplier, category, unit_price)
 _CATALOG = [
     ("microsoft 365 e3", "softline", "license", 210000.0),
@@ -172,7 +172,7 @@ def _group_qty(rng: np.random.Generator, category: str) -> int:
 def generate(seed: int = 42):
     """Generate (df_a, df_b, ground_truth) deterministically for a given seed.
 
-    Both DataFrames carry exactly the SPEC.md schema columns. df_b differs from
+    Both DataFrames carry exactly the canonical schema columns. df_b differs from
     df_a by four planted discrepancies plus small realistic price negotiation
     jitter on the remaining shared items (kept small enough not to trip an
     anomaly threshold).

@@ -22,7 +22,7 @@ Every chart and table is a native pptx object (CategoryChartData-backed
 chart, a real table), never a flattened image — a reviewer must be able
 to hand-edit this before sign-off, same as the .docx.
 
-Per SPEC.md architecture rule: this module is pure — no streamlit imports.
+Architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from core.budget_auditor.narrator_bridge import _bool_col
 from core.budget_auditor.parser import capex_opex_table, year_trend
 from core.conclusion_generator import _atk_rows, _clarification_rows, _format_amount, _summary_rows
 
-# --- palette (same SPEC design system as app.py / conclusion_generator's .docx)
+# --- palette (same design system as app.py / conclusion_generator's .docx)
 _NAVY = RGBColor.from_string("1F3A5F")
 _SURFACE = RGBColor.from_string("FAF9F6")
 _INK = RGBColor.from_string("2C2C2A")

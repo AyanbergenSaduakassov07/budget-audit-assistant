@@ -2,9 +2,9 @@
 
 `compare` is the single entry point. It normalizes both inputs, joins them on
 (item_name, supplier), computes every per-row and summary field defined in
-SPEC.md, and returns a single dict of results.
+the canonical schema, and returns a single dict of results.
 
-Per SPEC.md architecture rule: this module is pure — no streamlit imports.
+Architecture rule: this module is pure — no streamlit imports.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ _MATCHED_COLUMNS = [
 
 
 def _with_arithmetic_error(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with the SPEC.md arithmetic_error flag on every row."""
+    """Return a copy with the arithmetic_error flag on every row."""
     out = df.copy()
     out["arithmetic_error"] = (out["subtotal"] - out["qty"] * out["unit_price"]).abs() > 0.01
     return out
@@ -82,7 +82,7 @@ def _rollup(matched: pd.DataFrame, by: str) -> pd.DataFrame:
 
 
 def compare(df_a: pd.DataFrame, df_b: pd.DataFrame, threshold_pct: float = 15.0) -> dict:
-    """Compare two procurement sheets. See SPEC.md for every field's definition.
+    """Compare two procurement sheets. See the field list in this module.
 
     Returns a dict with keys: matched, only_in_a, only_in_b, summary,
     supplier_rollup, category_rollup.
