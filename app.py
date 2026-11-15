@@ -1,4 +1,4 @@
-"""ACM IT Budget Auditor — single-page, chat-first Streamlit app.
+"""IT Budget Auditor — single-page, chat-first Streamlit app.
 
 The conversation IS the app (ChatGPT-style): one st.chat_input with
 accept_file=True is the only input on the page. Dropping a ИТ-бюджет .xlsx into it
@@ -381,7 +381,7 @@ def _cached_conclusion_docx(file_bytes: bytes, threshold: float) -> tuple[bytes,
     try:
         a = _analyze(file_bytes, threshold)
         result = build_audit_result(a["meta"], a["combined"])
-        entity = str(result.get("entity") or "компании").strip().replace(" ", "_")
+        entity = str(result.get("entity") or "Компания").strip().replace(" ", "_")
         filename = f"Заключение_{entity}_{result.get('budget_year') or ''}.docx".replace("_.", ".")
         out_dir = tempfile.mkdtemp()
         out_path = generate_conclusion(result, os.path.join(out_dir, filename))
@@ -403,7 +403,7 @@ def _cached_conclusion_pptx(file_bytes: bytes, threshold: float) -> tuple[bytes,
     try:
         a = _analyze(file_bytes, threshold)
         result = build_audit_result(a["meta"], a["combined"])
-        entity = str(result.get("entity") or "компании").strip().replace(" ", "_")
+        entity = str(result.get("entity") or "Компания").strip().replace(" ", "_")
         filename = f"Заключение_{entity}_{result.get('budget_year') or ''}.pptx".replace("_.", ".")
         out_dir = tempfile.mkdtemp()
         out_path = generate_pptx_conclusion(
@@ -563,7 +563,7 @@ def render_analysis(entry: dict) -> None:
     if not a["flagged_sheets"]:
         st.warning(
             "Ни в одном листе не найдено заполненных статей расхода. "
-            "Проверьте, что это действительно форма ИТ-расходов компании."
+            "Проверьте, что это действительно форма ИТ-расходов."
         )
         return
     # Opening text: LLM executive summary when OPENROUTER_API_KEY is set and the
@@ -659,10 +659,10 @@ def answer_question(question: str) -> str:
 
 
 # --- page ----------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Аудит IT-бюджетов компании", page_icon=None)
+st.set_page_config(layout="wide", page_title="Аудит IT-бюджетов", page_icon=None)
 inject_css()
 
-st.markdown('<p class="app-title">Аудит IT-бюджетов компании</p>', unsafe_allow_html=True)
+st.markdown('<p class="app-title">Аудит IT-бюджетов</p>', unsafe_allow_html=True)
 
 history = st.session_state.setdefault("file_chat_history", [])
 
@@ -698,7 +698,7 @@ with st.popover("Настройки", icon=":material/settings:"):
         st.session_state["file_chat_history"] = []
         st.session_state.pop("active_file", None)
         st.rerun()
-    st.caption("Аудит IT-бюджетов")
+    st.caption("Аудит IT-бюджетов · прототип")
 
 submitted = st.chat_input(
     "Загрузите файл или задайте вопрос",

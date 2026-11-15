@@ -10,7 +10,6 @@ requested and would spend real quota.
 import json
 
 import pandas as pd
-import pytest
 
 from core.budget_narrator import (
     _build_context,

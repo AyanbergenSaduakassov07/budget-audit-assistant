@@ -1,4 +1,4 @@
-"""Ingest real ACM corporate budget-export workbooks into clean flat DataFrames.
+"""Ingest corporate budget-export workbooks into clean flat DataFrames.
 
 These files come out of a corporate planning tool and have a fundamentally
 different shape than the synthetic procurement schema (see core/schema.py):

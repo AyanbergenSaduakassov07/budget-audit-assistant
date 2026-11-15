@@ -1,5 +1,5 @@
 """Regression tests for four issues found via direct cell-level inspection of
-a real ACM file (a sample budget form):
+a sample budget form:
 
   1. budget codes that don't match the "AA-AA-00" format must be flagged
      (anomalous_code_flag), not silently forward-filled as if normal.
@@ -236,7 +236,7 @@ def test_budget_audit_concentration_risk_excludes_compound_counterparty():
 
 # --- 5. footer-detection regression: free text vs. section subtotal vs. true end ---
 # The all-columns footer scan added to fix issue 2 above was itself a regression,
-# confirmed against 4 real ACM files:
+# confirmed against sample forms:
 #   (a) the "итог|результат" search matched free-text justification/description
 #       prose ("результатов инвентаризации оборудования") and truncated the
 #       sheet after 1-2 rows;

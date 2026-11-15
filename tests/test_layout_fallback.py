@@ -17,7 +17,6 @@ Split in two halves:
 import json
 
 import openpyxl
-import pytest
 
 from core.budget_auditor.layout_fallback import (
     _extract_sample,

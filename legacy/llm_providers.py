@@ -5,7 +5,7 @@ legacy.query_engine and core.budget_narrator drive an LLMProvider through two
 methods, generate_sql(prompt) and generate_json(prompt), instead of importing
 openai directly. Provider selection (get_provider), in order:
   1. LOCAL_LLM_BASE_URL set -> OpenRouterProvider pointed at that internal
-     OpenAI-compatible endpoint (vLLM/TGI etc — the company's own serving stack),
+     OpenAI-compatible endpoint (vLLM/TGI etc — an internal serving stack),
      using LOCAL_LLM_MODEL and (optional) LOCAL_LLM_API_KEY.
   2. OPENROUTER_API_KEY set -> OpenRouterProvider pointed at OpenRouter,
      currently configured for qwen/qwen3.6-27b.
@@ -168,7 +168,7 @@ def _log_call(model: str, started_at: float, response, attempt: int) -> None:
 class OpenRouterProvider:
     """openai SDK client pointed at any OpenAI-compatible chat-completions
     endpoint -- OpenRouter by default, or an internal server (base_url
-    overridden, e.g. the company's own vLLM/TGI deployment via LOCAL_LLM_BASE_URL).
+    overridden, e.g. an internal vLLM/TGI deployment via LOCAL_LLM_BASE_URL).
     The retry/backoff/logging policy is identical either way; only
     base_url/model/api_key differ, so this stays one implementation rather
     than a parallel class per target."""

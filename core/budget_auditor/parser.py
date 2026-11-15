@@ -1,8 +1,7 @@
 """
 IT-budget form parser.
 
-Ground truth about the real files (verified against 5 actual subsidiary forms:
-Subsidiary A, Subsidiary B, Subsidiary B, "sample form A", "sample form B"):
+Layout assumptions, derived from sample subsidiary budget forms:
 
 - Metadata block sits in rows 2-6, column C = label, column D = value
   (Год кампании, Версия, Компания, Валюта, Ед. измерения).
@@ -20,7 +19,7 @@ Subsidiary A, Subsidiary B, Subsidiary B, "sample form A", "sample form B"):
 - Column SET and column NAMING both drift between subsidiaries/versions of the same
   template -- this is the actual root cause of "some files don't parse right", not
   a structural bug in any one file:
-    * "2025 год факт" (Subsidiary A) vs "ФАКТ за 2025 год" (another) --
+    * "2025 год факт" (one form style) vs "ФАКТ за 2025 год" (another) --
       same meaning, word order flipped. Must match on tokens ("факт" + a year),
       not a fixed phrase.
     * "2026 год утвержденный план" (Subsidiary A) vs "ПЛАН за 2026 год" (no "утвержденный" at

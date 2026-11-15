@@ -47,7 +47,7 @@ GROUP_COLUMNS = [
 # extra items required for the group build (Zoom, SAP, Cisco, HP servers) and a
 # few service / miscellaneous lines so all four category values are exercised.
 # Category VALUES are stored in Russian ("лицензия" | "оборудование" | "услуга"
-# | "прочее"), because real ACM data arrives in Russian; only the DataFrame
+# | "прочее"), because source data arrives in Russian; only the DataFrame
 # column NAMES stay English. (item_name, supplier, category, base_unit_price_kzt)
 _GROUP_CATALOG = [
     ("microsoft 365 e3", "softline", "лицензия", 210000.0),

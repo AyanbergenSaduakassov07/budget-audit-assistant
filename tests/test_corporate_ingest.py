@@ -11,7 +11,6 @@ from core.corporate_ingest import (
     detect_metadata_block,
     find_header_row,
     flatten_headers,
-    canonicalize,
     compute_deltas,
     extract_sheet,
     extract_workbook,
